@@ -1,6 +1,6 @@
 FROM python:3.12-alpine
 
-RUN apk add --no-cache ffmpeg ca-certificates
+RUN apk add --no-cache ffmpeg nodejs ca-certificates
 
 WORKDIR /app
 COPY requirements.txt .
