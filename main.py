@@ -59,7 +59,7 @@ YOUTUBE_URL_RE = re.compile(
 )
 
 YOUTUBE_EXTRACTOR_ARGS = {
-    "youtube": {"player_client": ["android_vr"]}
+    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
 }
 YOUTUBE_REMOTE_COMPONENTS = {"ejs:github"}
 
