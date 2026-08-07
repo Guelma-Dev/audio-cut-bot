@@ -149,6 +149,7 @@ async def get_video_info(url: str) -> dict:
             "quiet": True,
             "noplaylist": True,
             "skip_download": True,
+            "js_runtimes": {"node": {}, "deno": {}},
             "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
             "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         }
@@ -213,6 +214,7 @@ async def download_audio(
                 "fragment_retries": 5,
                 "socket_timeout": 60,
                 "concurrent_fragment_downloads": 10,
+                "js_runtimes": {"node": {}, "deno": {}},
                 "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
                 "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         }
