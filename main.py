@@ -41,6 +41,16 @@ PORT = int(os.getenv("PORT", "8080"))
 BOT_API_URL = os.getenv("BOT_API_URL", "https://api.telegram.org/bot")
 BOT_API_FILE_URL = os.getenv("BOT_API_FILE_URL", "https://api.telegram.org/file/bot")
 
+COOKIES_FILE = ""
+if os.getenv("COOKIES_TXT"):
+    _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
+    try:
+        with open(_cookies_path, "w", encoding="utf-8") as _f:
+            _f.write(os.getenv("COOKIES_TXT"))
+        COOKIES_FILE = _cookies_path
+    except OSError:
+        COOKIES_FILE = ""
+
 WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
 
 YOUTUBE_URL_RE = re.compile(
@@ -135,15 +145,16 @@ async def safe_edit(message, text: str) -> None:
 
 async def get_video_info(url: str) -> dict:
     def _fetch():
-        with yt_dlp.YoutubeDL(
-            {
-                "quiet": True,
-                "noplaylist": True,
-                "skip_download": True,
-                "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-                "remote_components": YOUTUBE_REMOTE_COMPONENTS,
-            }
-        ) as ydl:
+        options = {
+            "quiet": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
+            "remote_components": YOUTUBE_REMOTE_COMPONENTS,
+        }
+        if COOKIES_FILE:
+            options["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(options) as ydl:
             return ydl.extract_info(url, download=False)
 
     return await asyncio.to_thread(_fetch)
@@ -205,6 +216,8 @@ async def download_audio(
                 "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
                 "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         }
+        if COOKIES_FILE:
+            options["cookiefile"] = COOKIES_FILE
         if FFMPEG_LOCATION:
             options["ffmpeg_location"] = FFMPEG_LOCATION
         if progress_hook:
