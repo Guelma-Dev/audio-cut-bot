@@ -1,9 +1,9 @@
 name: audio-cut-bot
 services:
   - name: web
-    instance_type: nano
+    instance_type: free
     regions:
-      - par
+      - fra
     ports:
       - port: 8080
         protocol: http
@@ -20,3 +20,5 @@ services:
         value: "8080"
       - key: ALLOWED_USER_IDS
         value: "6586489447"
+      - key: WEBHOOK_URL
+        value: "https://{{ env.KOYEB_PUBLIC_DOMAIN }}"
