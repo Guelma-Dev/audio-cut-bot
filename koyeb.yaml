@@ -1,0 +1,22 @@
+name: audio-cut-bot
+services:
+  - name: web
+    instance_type: nano
+    regions:
+      - par
+    ports:
+      - port: 8080
+        protocol: http
+    routes:
+      - path: /
+    scalings:
+      min: 1
+      max: 1
+    git:
+      repository: Guelma-Dev/audio-cut-bot
+      branch: main
+    env:
+      - key: PORT
+        value: "8080"
+      - key: ALLOWED_USER_IDS
+        value: "6586489447"
