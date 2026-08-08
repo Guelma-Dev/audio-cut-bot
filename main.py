@@ -28,7 +28,7 @@ ALLOWED_USER_IDS = {
 }
 MAX_SEGMENT_SECONDS = int(os.getenv("MAX_SEGMENT_SECONDS", "7200"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-PROCESS_TIMEOUT = int(os.getenv("PROCESS_TIMEOUT", "180"))
+PROCESS_TIMEOUT = int(os.getenv("PROCESS_TIMEOUT", "600"))
 TEMP_DIR = os.environ.get("TEMP_DIR") or tempfile.gettempdir()
 PORT = int(os.getenv("PORT", "8080"))
 
@@ -37,6 +37,7 @@ QUALITY_OPTIONS = {
     "high": {"label": "عالية (أفضل جودة)", "bitrate": None},
     "medium": {"label": "متوسطة (128k)", "bitrate": 128},
     "low": {"label": "منخفضة (64k)", "bitrate": 64},
+    "very_low": {"label": "منخفضة جداً (48k)", "bitrate": 48},
 }
 DEFAULT_QUALITY = "high"
 
@@ -547,6 +548,9 @@ def quick_keyboard() -> dict:
                 {"text": "جودة: منخفضة 64k", "callback_data": "quality:low"},
             ],
             [
+                {"text": "جودة: منخفضة جداً 48k", "callback_data": "quality:very_low"},
+            ],
+            [
                 {"text": "إلغاء", "callback_data": "cancel"},
             ],
         ]
@@ -614,6 +618,7 @@ async def handle_time(chat_id: int, session: dict, message: dict, text: str) -> 
         "عالي": "high", "عالية": "high", "عالي جداً": "high",
         "متوسط": "medium", "متوسطة": "medium",
         "منخفض": "low", "منخفضة": "low", "64": "low", "128": "medium",
+        "منخفضةجداً": "very_low", "منخفضجدا": "very_low", "48": "very_low",
     }
     clean = text.strip().replace(" ", "")
     if clean in quality_words or clean.lower() in {"high", "medium", "low"}:
