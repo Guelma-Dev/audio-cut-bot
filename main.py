@@ -63,11 +63,6 @@ elif os.getenv("COOKIES_TXT"):
 
 WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
 
-if COOKIES_FILE:
-    logger.info("تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
-else:
-    logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
-
 YOUTUBE_URL_RE = re.compile(
     r"(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)"
     r"([A-Za-z0-9_-]{11})"
@@ -87,6 +82,11 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+if COOKIES_FILE:
+    logger.info("تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
+else:
+    logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
 
 
 def parse_time(value: str) -> int | None:
