@@ -97,6 +97,8 @@ else:
 
 def base_ytdlp_options() -> dict:
     options = {"quiet": True, "noplaylist": True, "js_runtimes": {"node": {}, "deno": {}}}
+    if DENO_PATH:
+        options["js_runtimes"]["deno"]["path"] = DENO_PATH
     if BGUTIL_SERVER_HOME:
         options.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
             "base_url": "http://127.0.0.1:4416"
