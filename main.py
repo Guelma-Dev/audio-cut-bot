@@ -42,7 +42,16 @@ BOT_API_URL = os.getenv("BOT_API_URL", "https://api.telegram.org/bot")
 BOT_API_FILE_URL = os.getenv("BOT_API_FILE_URL", "https://api.telegram.org/file/bot")
 
 COOKIES_FILE = ""
-if os.getenv("COOKIES_TXT"):
+_cookies_b64 = os.getenv("COOKIES_TXT_B64", "")
+if _cookies_b64:
+    _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
+    try:
+        with open(_cookies_path, "wb") as _f:
+            _f.write(base64.b64decode(_cookies_b64))
+        COOKIES_FILE = _cookies_path
+    except Exception:
+        COOKIES_FILE = ""
+elif os.getenv("COOKIES_TXT"):
     _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
     try:
         with open(_cookies_path, "w", encoding="utf-8") as _f:
