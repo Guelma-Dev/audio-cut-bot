@@ -662,7 +662,7 @@ def build_application() -> Application:
     return application
 
 
-def run_webhook_mode(application: Application) -> None:
+def run_webhook_mode(application: Application | None) -> None:
     import uvicorn
     from fastapi import FastAPI, Request
     from fastapi.responses import JSONResponse, Response
@@ -671,6 +671,9 @@ def run_webhook_mode(application: Application) -> None:
 
     @web_app.on_event("startup")
     async def _startup():
+        if application is None:
+            logger.error("لا يوجد تطبيق بوت لتفعيل webhook.")
+            return
         await application.initialize()
         await application.start()
         webhook_secret = WEBHOOK_SECRET or None
@@ -683,8 +686,9 @@ def run_webhook_mode(application: Application) -> None:
 
     @web_app.on_event("shutdown")
     async def _shutdown():
-        await application.stop()
-        await application.shutdown()
+        if application is not None:
+            await application.stop()
+            await application.shutdown()
 
     @web_app.get("/healthz")
     async def _healthz():
@@ -692,6 +696,8 @@ def run_webhook_mode(application: Application) -> None:
 
     @web_app.post(WEBHOOK_PATH)
     async def _webhook(request: Request):
+        if application is None:
+            return Response(status_code=503)
         if WEBHOOK_SECRET and (
             request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET
         ):
@@ -704,7 +710,7 @@ def run_webhook_mode(application: Application) -> None:
     uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
 
 
-def run_polling_with_health(application: Application) -> None:
+def run_polling_with_health(application: Application | None) -> None:
     import uvicorn
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
@@ -713,6 +719,9 @@ def run_polling_with_health(application: Application) -> None:
 
     @web_app.on_event("startup")
     async def _startup():
+        if application is None:
+            logger.error("لا يوجد تطبيق بوت لبدء polling.")
+            return
         await application.initialize()
         await application.start()
         await application.updater.start_polling(
@@ -725,8 +734,9 @@ def run_polling_with_health(application: Application) -> None:
 
     @web_app.on_event("shutdown")
     async def _shutdown():
-        await application.stop()
-        await application.shutdown()
+        if application is not None:
+            await application.stop()
+            await application.shutdown()
 
     @web_app.get("/healthz")
     async def _healthz():
@@ -737,9 +747,15 @@ def run_polling_with_health(application: Application) -> None:
 
 def main() -> None:
     if not BOT_TOKEN:
-        logger.error("لم يتم تحديد BOT_TOKEN. اضبط متغير البيئة BOT_TOKEN أولاً ثم أعد التشغيل.")
+        logger.error(
+            "لم يتم تحديد BOT_TOKEN. اضبط متغير البيئة BOT_TOKEN أولاً ثم أعد التشغيل."
+        )
 
-    application = build_application()
+    try:
+        application = build_application()
+    except Exception as exc:
+        logger.error("فشل بناء التطبيق: %s", exc)
+        application = None
 
     if WEBHOOK_URL:
         run_webhook_mode(application)
