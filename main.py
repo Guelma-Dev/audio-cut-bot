@@ -774,6 +774,39 @@ def run_webhook_mode(application: Application | None) -> None:
     async def _healthz():
         return JSONResponse({"status": "ok"})
 
+    @web_app.get("/diag")
+    async def _diag():
+        import asyncio
+        results = {}
+        for label, args in [
+            ("FAST_android_creator", {"youtube": {"player_client": ["android_creator"]}}),
+            ("FULL", {"youtube": {"player_client": ["android_creator", "tv", "web_safari", "web_embedded"]}}),
+            ("tv_only", {"youtube": {"player_client": ["tv"]}}),
+            ("web_safari_only", {"youtube": {"player_client": ["web_safari"]}}),
+            ("web_embedded_only", {"youtube": {"player_client": ["web_embedded"]}}),
+            ("default", None),
+        ]:
+            def _try(args=args):
+                opts = {
+                    "quiet": True,
+                    "noplaylist": True,
+                    "skip_download": True,
+                    "js_runtimes": {"node": {}, "deno": {}},
+                }
+                if args:
+                    opts["extractor_args"] = args
+                if COOKIES_FILE:
+                    opts["cookiefile"] = COOKIES_FILE
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info("https://www.youtube.com/watch?v=rupFLbOkioQ", download=False)
+            try:
+                info = await asyncio.to_thread(_try)
+                fmts = info.get("formats") or []
+                results[label] = f"OK title={info.get('title')!r} formats={len(fmts)} with_url={sum(1 for f in fmts if f.get('url'))}"
+            except Exception as exc:
+                results[label] = f"FAIL {str(exc)[:150]}"
+        return JSONResponse(results)
+
     @web_app.post(WEBHOOK_PATH)
     async def _webhook(request: Request):
         if application is None:
