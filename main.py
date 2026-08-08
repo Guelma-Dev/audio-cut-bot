@@ -775,12 +775,7 @@ def run_polling_with_health(application: Application | None) -> None:
         try:
             await application.initialize()
             await application.start()
-            await application.updater.start_polling(
-                drop_pending_updates=True,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=20,
-            )
+            await application.updater.start_polling(drop_pending_updates=True)
             logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
         except Exception:
             logger.exception("فشل تشغيل البوت بوضع polling")
