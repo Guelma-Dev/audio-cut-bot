@@ -12,9 +12,13 @@ echo "=== تثبيت مكتبات البوت ==="
 pip install --upgrade pip
 pip install aiogram yt-dlp aiohttp
 
+echo "=== تنزيل ملف البوت تلقائياً ==="
+mkdir -p ~/audiobot
+curl -sL https://raw.githubusercontent.com/Guelma-Dev/audio-cut-bot/main/main.py -o ~/audiobot/main.py
+curl -sL https://raw.githubusercontent.com/Guelma-Dev/audio-cut-bot/main/termux/run.sh -o ~/audiobot/run.sh
+chmod +x ~/audiobot/run.sh
+
 echo ""
 echo "✅ اكتمل التثبيت!"
-echo "الآن انسخ ملف البوت:"
-echo "    cp ~/storage/downloads/audio-cut-bot/main.py ~/audiobot/main.py"
-echo "ثم شغّل:"
+echo "لتشغيل البوت اكتب:"
 echo "    cd ~/audiobot && bash run.sh"
