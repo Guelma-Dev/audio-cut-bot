@@ -61,9 +61,6 @@ elif os.getenv("COOKIES_TXT"):
     except OSError:
         COOKIES_FILE = ""
 
-BGUTIL_SERVER_HOME = os.getenv("BGUTIL_SERVER_HOME", "")
-DENO_PATH = os.getenv("DENO_PATH", "deno")
-
 WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
 
 YOUTUBE_URL_RE = re.compile(
@@ -71,15 +68,10 @@ YOUTUBE_URL_RE = re.compile(
     r"([A-Za-z0-9_-]{11})"
 )
 
-YOUTUBE_EXTRACTOR_ARGS_FAST = {
-    "youtube": {"player_client": ["tv"]}
+YOUTUBE_EXTRACTOR_ARGS = {
+    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
 }
-YOUTUBE_EXTRACTOR_ARGS_FULL = {
-    "youtube": {"player_client": ["tv", "web_safari", "web_embedded"]}
-}
-YOUTUBE_EXTRACTOR_ARGS_POT = {
-    "youtube": {"player_client": ["mweb"]}
-}
+YOUTUBE_REMOTE_COMPONENTS = {"ejs:github"}
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
 
@@ -88,24 +80,6 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-
-if COOKIES_FILE:
-    logger.info("تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
-else:
-    logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
-
-
-def base_ytdlp_options(use_cookies: bool = True) -> dict:
-    options = {"quiet": True, "noplaylist": True, "js_runtimes": {"node": {}, "deno": {}}}
-    if DENO_PATH:
-        options["js_runtimes"]["deno"]["path"] = DENO_PATH
-    if BGUTIL_SERVER_HOME:
-        options.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
-            "base_url": "http://127.0.0.1:4416"
-        }
-    if use_cookies and COOKIES_FILE:
-        options["cookiefile"] = COOKIES_FILE
-    return options
 
 
 def parse_time(value: str) -> int | None:
@@ -181,28 +155,18 @@ async def safe_edit(message, text: str) -> None:
 
 async def get_video_info(url: str) -> dict:
     def _fetch():
-        def _attempt(extractor_args: dict) -> dict:
-            options = base_ytdlp_options()
-            options.update({
-                "skip_download": True,
-                "extractor_args": extractor_args,
-            })
-            with yt_dlp.YoutubeDL(options) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        for name, args in [
-            ("FAST", YOUTUBE_EXTRACTOR_ARGS_FAST),
-            ("FULL", YOUTUBE_EXTRACTOR_ARGS_FULL),
-            ("POT", YOUTUBE_EXTRACTOR_ARGS_POT),
-        ]:
-            if name == "POT" and not BGUTIL_SERVER_HOME:
-                break
-            try:
-                logger.info("get_video_info: محاولة %s", name)
-                return _attempt(args)
-            except Exception as exc:
-                logger.warning("get_video_info: فشلت محاولة %s: %s", name, str(exc)[:160])
-        raise RuntimeError("فشل جلب معلومات الفيديو بكل المحاولات")
+        options = {
+            "quiet": True,
+            "noplaylist": True,
+            "skip_download": True,
+            "js_runtimes": {"node": {}, "deno": {}},
+            "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
+            "remote_components": YOUTUBE_REMOTE_COMPONENTS,
+        }
+        if COOKIES_FILE:
+            options["cookiefile"] = COOKIES_FILE
+        with yt_dlp.YoutubeDL(options) as ydl:
+            return ydl.extract_info(url, download=False)
 
     return await asyncio.to_thread(_fetch)
 
@@ -247,52 +211,31 @@ async def download_audio(
     progress_hook=None,
     quality_kbps: int = 192,
     phase_cb=None,
-    info=None,
 ) -> str | None:
     def _run() -> str | None:
         is_full = start is None and end is None
-        options = base_ytdlp_options()
-        options.update({
+        options = {
                 "format": "bestaudio[ext=m4a]/bestaudio/best",
                 "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
+                "noplaylist": True,
+                "quiet": True,
                 "no_warnings": True,
                 "retries": 5,
                 "fragment_retries": 5,
                 "socket_timeout": 60,
                 "concurrent_fragment_downloads": 10,
-                "extractor_args": YOUTUBE_EXTRACTOR_ARGS_FAST,
-        })
+                "js_runtimes": {"node": {}, "deno": {}},
+                "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
+                "remote_components": YOUTUBE_REMOTE_COMPONENTS,
+        }
+        if COOKIES_FILE:
+            options["cookiefile"] = COOKIES_FILE
         if FFMPEG_LOCATION:
             options["ffmpeg_location"] = FFMPEG_LOCATION
         if progress_hook:
             options["progress_hooks"] = [progress_hook]
-        try:
-            with yt_dlp.YoutubeDL(options) as ydl:
-                if info is not None:
-                    ydl.process_ie_result(info, download=True)
-                else:
-                    ydl.extract_info(url, download=True)
-        except Exception as exc:
-            if not BGUTIL_SERVER_HOME:
-                raise
-            logger.warning("فشل التنزيل بالعميل الأساسي (%s)، إعادة بالمشغل mweb+bgutil", exc)
-            fallback = base_ytdlp_options()
-            fallback.update({
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
-                "no_warnings": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "socket_timeout": 60,
-                "concurrent_fragment_downloads": 10,
-                "extractor_args": YOUTUBE_EXTRACTOR_ARGS_POT,
-            })
-            if FFMPEG_LOCATION:
-                fallback["ffmpeg_location"] = FFMPEG_LOCATION
-            if progress_hook:
-                fallback["progress_hooks"] = [progress_hook]
-            with yt_dlp.YoutubeDL(fallback) as ydl:
-                ydl.extract_info(url, download=True)
+        with yt_dlp.YoutubeDL(options) as ydl:
+            ydl.extract_info(url, download=True)
 
         matches = sorted(glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")))
         native = next((p for p in matches if not p.endswith(".part")), None)
@@ -346,79 +289,29 @@ async def download_audio(
             return native
 
         if phase_cb:
-            phase_cb("تم تنزيل الصوت (100%). جاري قصّ المقطع بنسخ مباشر سريع (بدون إعادة ترميز)...")
-        ext = os.path.splitext(native)[1].lower()
-        if ext not in (".m4a", ".webm"):
-            ext = ".m4a"
-        cut_path = os.path.join(TEMP_DIR, f"{uid}.cut{ext}")
-        copy_cmd = [
-            ffmpeg_bin(),
-            "-y",
-            "-ss",
-            str(start),
-            "-t",
-            str(end - start),
-            "-i",
-            native,
-            "-c:a",
-            "copy",
-            "-map_metadata",
-            "-1",
-        ]
-        if ext == ".m4a":
-            copy_cmd += ["-movflags", "+faststart"]
-        copy_cmd.append(cut_path)
-        try:
-            subprocess.run(copy_cmd, check=True, capture_output=True)
-        except subprocess.CalledProcessError:
-            if phase_cb:
-                phase_cb("تعذّر القصّ بالنسخ المباشر، جاري التحويل إلى M4A...")
-            cut_path = os.path.join(TEMP_DIR, f"{uid}.cut.m4a")
-            subprocess.run(
-                [
-                    ffmpeg_bin(),
-                    "-y",
-                    "-ss",
-                    str(start),
-                    "-t",
-                    str(end - start),
-                    "-i",
-                    native,
-                    "-codec:a",
-                    "aac",
-                    "-b:a",
-                    "128k",
-                    cut_path,
-                ],
-                check=True,
-                capture_output=True,
-            )
-
-        final = cut_path
-        if os.path.getsize(final) > MAX_UPLOAD_BYTES:
-            if phase_cb:
-                phase_cb("حجم المقطع كبير، جاري ضغطه إلى MP3 بالجودة المختارة...")
-            mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
-            subprocess.run(
-                [
-                    ffmpeg_bin(),
-                    "-y",
-                    "-i",
-                    final,
-                    "-codec:a",
-                    "libmp3lame",
-                    "-b:a",
-                    f"{quality_kbps}k",
-                    mp3_path,
-                ],
-                check=True,
-                capture_output=True,
-            )
-            os.remove(final)
-            final = mp3_path
-
+            phase_cb("تم تنزيل الصوت (100%). جاري قصّ وتحويل المقطع إلى MP3...")
+        mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
+        subprocess.run(
+            [
+                ffmpeg_bin(),
+                "-y",
+                "-ss",
+                str(start),
+                "-t",
+                str(end - start),
+                "-i",
+                native,
+                "-codec:a",
+                "libmp3lame",
+                "-b:a",
+                f"{quality_kbps}k",
+                mp3_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
         os.remove(native)
-        return final
+        return mp3_path
 
     return await asyncio.to_thread(_run)
 
@@ -502,13 +395,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = await update.message.reply_text("جاري جلب معلومات الفيديو...")
     try:
-        info = await asyncio.wait_for(get_video_info(context.user_data["url"]), timeout=90)
-    except asyncio.TimeoutError:
-        logger.error("انتهت مهلة جلب معلومات الفيديو (handle_url)")
-        await safe_edit(status, "انتهت مهلة جلب معلومات الفيديو (أكثر من 90 ثانية). يرجى المحاولة مرة أخرى.")
-        return WAITING_FOR_URL
+        info = await get_video_info(context.user_data["url"])
     except Exception as exc:
-        logger.exception("فشل جلب معلومات الفيديو (handle_url): %s", context.user_data["url"])
         await safe_edit(status, arabic_error(exc))
         return WAITING_FOR_URL
 
@@ -518,7 +406,6 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["title"] = title
     context.user_data["duration"] = duration
-    context.user_data["video_info"] = info
 
     text = (
         f"تم التعرف على الفيديو:\n\n"
@@ -628,14 +515,12 @@ async def process(context: ContextTypes.DEFAULT_TYPE, status) -> None:
     start = context.user_data.get("start")
     end = context.user_data.get("end")
 
-    info = context.user_data.pop("video_info", None)
-    if info is None:
-        try:
-            info = await get_video_info(url)
-        except Exception as exc:
-            logger.exception("فشل جلب معلومات الفيديو")
-            await safe_edit(status, arabic_error(exc))
-            return
+    try:
+        info = await get_video_info(url)
+    except Exception as exc:
+        logger.exception("فشل جلب معلومات الفيديو")
+        await safe_edit(status, arabic_error(exc))
+        return
 
     duration = info.get("duration") or 0
     title = (info.get("title") or "مقطع صوتي").strip()
@@ -698,7 +583,6 @@ async def process(context: ContextTypes.DEFAULT_TYPE, status) -> None:
             progress_hook=progress_hook,
             quality_kbps=quality_kbps,
             phase_cb=phase_cb,
-            info=info,
         )
         if not final_path:
             raise RuntimeError("لم يتم إنشاء ملف الصوت النهائي.")
@@ -820,32 +704,6 @@ def run_webhook_mode(application: Application | None) -> None:
     async def _healthz():
         return JSONResponse({"status": "ok"})
 
-    @web_app.get("/diag")
-    async def _diag():
-        import asyncio
-        url = "https://www.youtube.com/watch?v=rupFLbOkioQ"
-
-        def _try(client):
-            opts = base_ytdlp_options()
-            opts.update({
-                "quiet": True,
-                "noplaylist": True,
-                "skip_download": True,
-                "extractor_args": {"youtube": {"player_client": [client]}},
-            })
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        results = {}
-        for client in ["tv", "mweb"]:
-            try:
-                info = await asyncio.wait_for(asyncio.to_thread(_try, client), timeout=20)
-                fmts = info.get("formats") or []
-                results[client] = f"OK fmts={len(fmts)} url={sum(1 for f in fmts if f.get('url'))}"
-            except Exception as exc:
-                results[client] = f"FAIL {str(exc)[:80]}"
-        return JSONResponse(results)
-
     @web_app.post(WEBHOOK_PATH)
     async def _webhook(request: Request):
         if application is None:
@@ -877,7 +735,12 @@ def run_polling_with_health(application: Application | None) -> None:
         try:
             await application.initialize()
             await application.start()
-            await application.updater.start_polling(drop_pending_updates=True)
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=20,
+            )
             logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
         except Exception:
             logger.exception("فشل تشغيل البوت بوضع polling")
