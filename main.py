@@ -61,6 +61,9 @@ elif os.getenv("COOKIES_TXT"):
     except OSError:
         COOKIES_FILE = ""
 
+BGUTIL_SERVER_HOME = os.getenv("BGUTIL_SERVER_HOME", "")
+DENO_PATH = os.getenv("DENO_PATH", "deno")
+
 WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
 
 YOUTUBE_URL_RE = re.compile(
@@ -73,6 +76,9 @@ YOUTUBE_EXTRACTOR_ARGS_FAST = {
 }
 YOUTUBE_EXTRACTOR_ARGS_FULL = {
     "youtube": {"player_client": ["android_creator", "tv", "web_safari", "web_embedded"]}
+}
+YOUTUBE_EXTRACTOR_ARGS_POT = {
+    "youtube": {"player_client": ["mweb"]}
 }
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
@@ -87,6 +93,19 @@ if COOKIES_FILE:
     logger.info("تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
 else:
     logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
+
+
+def base_ytdlp_options() -> dict:
+    options = {"quiet": True, "noplaylist": True, "js_runtimes": {"node": {}, "deno": {}}}
+    if BGUTIL_SERVER_HOME:
+        options.setdefault("extractor_args", {})["youtubepot-bgutilscript"] = {
+            "server_home": BGUTIL_SERVER_HOME
+        }
+        if DENO_PATH:
+            options["js_runtimes"] = {"node": {}, "deno": {"path": DENO_PATH}}
+    if COOKIES_FILE:
+        options["cookiefile"] = COOKIES_FILE
+    return options
 
 
 def parse_time(value: str) -> int | None:
@@ -163,22 +182,25 @@ async def safe_edit(message, text: str) -> None:
 async def get_video_info(url: str) -> dict:
     def _fetch():
         def _attempt(extractor_args: dict) -> dict:
-            options = {
-                "quiet": True,
-                "noplaylist": True,
+            options = base_ytdlp_options()
+            options.update({
                 "skip_download": True,
-                "js_runtimes": {"node": {}, "deno": {}},
                 "extractor_args": extractor_args,
-            }
-            if COOKIES_FILE:
-                options["cookiefile"] = COOKIES_FILE
+            })
             with yt_dlp.YoutubeDL(options) as ydl:
                 return ydl.extract_info(url, download=False)
 
         try:
             return _attempt(YOUTUBE_EXTRACTOR_ARGS_FAST)
         except Exception:
+            pass
+        try:
             return _attempt(YOUTUBE_EXTRACTOR_ARGS_FULL)
+        except Exception:
+            pass
+        if BGUTIL_SERVER_HOME:
+            return _attempt(YOUTUBE_EXTRACTOR_ARGS_POT)
+        raise RuntimeError("فشل جلب معلومات الفيديو بكل المحاولات")
 
     return await asyncio.to_thread(_fetch)
 
@@ -227,29 +249,47 @@ async def download_audio(
 ) -> str | None:
     def _run() -> str | None:
         is_full = start is None and end is None
-        options = {
+        options = base_ytdlp_options()
+        options.update({
                 "format": "bestaudio[ext=m4a]/bestaudio/best",
                 "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
-                "noplaylist": True,
-                "quiet": True,
                 "no_warnings": True,
                 "retries": 5,
                 "fragment_retries": 5,
                 "socket_timeout": 60,
                 "concurrent_fragment_downloads": 10,
-                "js_runtimes": {"node": {}, "deno": {}},
                 "extractor_args": YOUTUBE_EXTRACTOR_ARGS_FAST,
-        }
-        if COOKIES_FILE:
-            options["cookiefile"] = COOKIES_FILE
+        })
         if FFMPEG_LOCATION:
             options["ffmpeg_location"] = FFMPEG_LOCATION
         if progress_hook:
             options["progress_hooks"] = [progress_hook]
-        with yt_dlp.YoutubeDL(options) as ydl:
-            if info is not None:
-                ydl.process_ie_result(info, download=True)
-            else:
+        try:
+            with yt_dlp.YoutubeDL(options) as ydl:
+                if info is not None:
+                    ydl.process_ie_result(info, download=True)
+                else:
+                    ydl.extract_info(url, download=True)
+        except Exception as exc:
+            if not BGUTIL_SERVER_HOME:
+                raise
+            logger.warning("فشل التنزيل بالعميل الأساسي (%s)، إعادة بالمشغل mweb+bgutil", exc)
+            fallback = base_ytdlp_options()
+            fallback.update({
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
+                "no_warnings": True,
+                "retries": 5,
+                "fragment_retries": 5,
+                "socket_timeout": 60,
+                "concurrent_fragment_downloads": 10,
+                "extractor_args": YOUTUBE_EXTRACTOR_ARGS_POT,
+            })
+            if FFMPEG_LOCATION:
+                fallback["ffmpeg_location"] = FFMPEG_LOCATION
+            if progress_hook:
+                fallback["progress_hooks"] = [progress_hook]
+            with yt_dlp.YoutubeDL(fallback) as ydl:
                 ydl.extract_info(url, download=True)
 
         matches = sorted(glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")))
