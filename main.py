@@ -98,11 +98,9 @@ else:
 def base_ytdlp_options() -> dict:
     options = {"quiet": True, "noplaylist": True, "js_runtimes": {"node": {}, "deno": {}}}
     if BGUTIL_SERVER_HOME:
-        options.setdefault("extractor_args", {})["youtubepot-bgutilscript"] = {
-            "server_home": BGUTIL_SERVER_HOME
+        options.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
+            "base_url": "http://127.0.0.1:4416"
         }
-        if DENO_PATH:
-            options["js_runtimes"] = {"node": {}, "deno": {"path": DENO_PATH}}
     if COOKIES_FILE:
         options["cookiefile"] = COOKIES_FILE
     return options

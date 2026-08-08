@@ -20,4 +20,4 @@ ENV PYTHONUNBUFFERED=1
 
 EXPOSE 8080
 
-CMD ["python", "main.py"]
+CMD ["sh", "-c", "deno run --allow-env --allow-net --allow-ffi=. --allow-read=. /opt/bgutil-ytdlp-pot-provider/server/src/main.ts -p 4416 & sleep 3 && python main.py"]
