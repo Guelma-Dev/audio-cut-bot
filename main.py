@@ -915,11 +915,51 @@ def run_ping_server() -> None:
 
 
 # ---------------------------------------------------------------------------
+# قفل يمنع تشغيل نسختين من البوت في نفس الوقت
+# ---------------------------------------------------------------------------
+LOCK_FILE = os.path.join(TEMP_DIR, "audiobot.lock")
+
+
+def acquire_lock() -> bool:
+    """يعيد False إن كان البوت يعمل بالفعل في عملية أخرى."""
+    try:
+        if os.path.exists(LOCK_FILE):
+            try:
+                with open(LOCK_FILE) as handle:
+                    pid = int(handle.read().strip() or "0")
+                if pid > 0:
+                    os.kill(pid, 0)
+                    return False
+            except (ValueError, ProcessLookupError, OSError):
+                pass
+        with open(LOCK_FILE, "w") as handle:
+            handle.write(str(os.getpid()))
+        return True
+    except Exception:
+        return True
+
+
+def release_lock() -> None:
+    try:
+        os.remove(LOCK_FILE)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # نقطة الدخول
 # ---------------------------------------------------------------------------
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("لا يوجد BOT_TOKEN. اضبط متغير البيئة.")
+        sys.exit(1)
+
+    if not acquire_lock():
+        logger.error("البوت يعمل بالفعل في نافذة أخرى!")
+        print(
+            "\n⚠️  البوت يعمل بالفعل في نافذة Termux أخرى!\n"
+            "أغلق النافذة القديمة (Ctrl+C) ثم أعد التشغيل هنا.\n"
+        )
         sys.exit(1)
 
     threading.Thread(target=run_ping_server, daemon=True).start()
@@ -929,6 +969,8 @@ def main() -> None:
         asyncio.run(polling_loop())
     except (KeyboardInterrupt, SystemExit):
         logger.info("تم إيقاف البوت.")
+    finally:
+        release_lock()
 
 
 if __name__ == "__main__":
