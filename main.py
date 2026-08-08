@@ -58,8 +58,11 @@ YOUTUBE_URL_RE = re.compile(
     r"([A-Za-z0-9_-]{11})"
 )
 
-YOUTUBE_EXTRACTOR_ARGS = {
+YOUTUBE_EXTRACTOR_ARGS_FAST = {
     "youtube": {"player_client": ["android_vr"]}
+}
+YOUTUBE_EXTRACTOR_ARGS_FULL = {
+    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
 }
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
@@ -144,17 +147,23 @@ async def safe_edit(message, text: str) -> None:
 
 async def get_video_info(url: str) -> dict:
     def _fetch():
-        options = {
-            "quiet": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "js_runtimes": {"node": {}, "deno": {}},
-            "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-        }
-        if COOKIES_FILE:
-            options["cookiefile"] = COOKIES_FILE
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=False)
+        def _attempt(extractor_args: dict) -> dict:
+            options = {
+                "quiet": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "js_runtimes": {"node": {}, "deno": {}},
+                "extractor_args": extractor_args,
+            }
+            if COOKIES_FILE:
+                options["cookiefile"] = COOKIES_FILE
+            with yt_dlp.YoutubeDL(options) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        try:
+            return _attempt(YOUTUBE_EXTRACTOR_ARGS_FAST)
+        except Exception:
+            return _attempt(YOUTUBE_EXTRACTOR_ARGS_FULL)
 
     return await asyncio.to_thread(_fetch)
 
@@ -214,7 +223,7 @@ async def download_audio(
                 "socket_timeout": 60,
                 "concurrent_fragment_downloads": 10,
                 "js_runtimes": {"node": {}, "deno": {}},
-                "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
+                "extractor_args": YOUTUBE_EXTRACTOR_ARGS_FAST,
         }
         if COOKIES_FILE:
             options["cookiefile"] = COOKIES_FILE
