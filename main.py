@@ -72,10 +72,10 @@ YOUTUBE_URL_RE = re.compile(
 )
 
 YOUTUBE_EXTRACTOR_ARGS_FAST = {
-    "youtube": {"player_client": ["android_creator"]}
+    "youtube": {"player_client": ["tv"]}
 }
 YOUTUBE_EXTRACTOR_ARGS_FULL = {
-    "youtube": {"player_client": ["android_creator", "tv", "web_safari", "web_embedded"]}
+    "youtube": {"player_client": ["tv", "web_safari", "web_embedded"]}
 }
 YOUTUBE_EXTRACTOR_ARGS_POT = {
     "youtube": {"player_client": ["mweb"]}
@@ -190,16 +190,18 @@ async def get_video_info(url: str) -> dict:
             with yt_dlp.YoutubeDL(options) as ydl:
                 return ydl.extract_info(url, download=False)
 
-        try:
-            return _attempt(YOUTUBE_EXTRACTOR_ARGS_FAST)
-        except Exception:
-            pass
-        try:
-            return _attempt(YOUTUBE_EXTRACTOR_ARGS_FULL)
-        except Exception:
-            pass
-        if BGUTIL_SERVER_HOME:
-            return _attempt(YOUTUBE_EXTRACTOR_ARGS_POT)
+        for name, args in [
+            ("FAST", YOUTUBE_EXTRACTOR_ARGS_FAST),
+            ("FULL", YOUTUBE_EXTRACTOR_ARGS_FULL),
+            ("POT", YOUTUBE_EXTRACTOR_ARGS_POT),
+        ]:
+            if name == "POT" and not BGUTIL_SERVER_HOME:
+                break
+            try:
+                logger.info("get_video_info: محاولة %s", name)
+                return _attempt(args)
+            except Exception as exc:
+                logger.warning("get_video_info: فشلت محاولة %s: %s", name, str(exc)[:160])
         raise RuntimeError("فشل جلب معلومات الفيديو بكل المحاولات")
 
     return await asyncio.to_thread(_fetch)
@@ -500,7 +502,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = await update.message.reply_text("جاري جلب معلومات الفيديو...")
     try:
-        info = await get_video_info(context.user_data["url"])
+        info = await asyncio.wait_for(get_video_info(context.user_data["url"]), timeout=90)
+    except asyncio.TimeoutError:
+        logger.error("انتهت مهلة جلب معلومات الفيديو (handle_url)")
+        await safe_edit(status, "انتهت مهلة جلب معلومات الفيديو (أكثر من 90 ثانية). يرجى المحاولة مرة أخرى.")
+        return WAITING_FOR_URL
     except Exception as exc:
         logger.exception("فشل جلب معلومات الفيديو (handle_url): %s", context.user_data["url"])
         await safe_edit(status, arabic_error(exc))
@@ -817,37 +823,27 @@ def run_webhook_mode(application: Application | None) -> None:
     @web_app.get("/diag")
     async def _diag():
         import asyncio
+        url = "https://www.youtube.com/watch?v=rupFLbOkioQ"
+
+        def _try(client):
+            opts = base_ytdlp_options()
+            opts.update({
+                "quiet": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "extractor_args": {"youtube": {"player_client": [client]}},
+            })
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
         results = {}
-        cookie_ok = False
-        try:
-            cookie_ok = os.path.isfile(COOKIES_FILE) and "SID" in open(COOKIES_FILE).read()
-        except Exception:
-            pass
-        results["cookies_sid"] = str(cookie_ok)
-        clients = {
-            "tv": (["tv"], True),
-        }
-        for label, url in [
-            ("normal_video", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
-            ("age_gated", "https://www.youtube.com/watch?v=rupFLbOkioQ"),
-        ]:
-            for cname, (c, use_cookies) in clients.items():
-                def _try(url=url, c=c, use_cookies=use_cookies):
-                    opts = base_ytdlp_options(use_cookies=use_cookies)
-                    opts.update({
-                        "quiet": True,
-                        "noplaylist": True,
-                        "skip_download": True,
-                        "extractor_args": {"youtube": {"player_client": c}},
-                    })
-                    with yt_dlp.YoutubeDL(opts) as ydl:
-                        return ydl.extract_info(url, download=False)
-                try:
-                    info = await asyncio.wait_for(asyncio.to_thread(_try), timeout=25)
-                    fmts = info.get("formats") or []
-                    results[f"{cname}@{label}"] = f"OK fmts={len(fmts)} url={sum(1 for f in fmts if f.get('url'))}"
-                except Exception as exc:
-                    results[f"{cname}@{label}"] = f"FAIL {str(exc)[:90]}"
+        for client in ["tv", "mweb"]:
+            try:
+                info = await asyncio.wait_for(asyncio.to_thread(_try, client), timeout=20)
+                fmts = info.get("formats") or []
+                results[client] = f"OK fmts={len(fmts)} url={sum(1 for f in fmts if f.get('url'))}"
+            except Exception as exc:
+                results[client] = f"FAIL {str(exc)[:80]}"
         return JSONResponse(results)
 
     @web_app.post(WEBHOOK_PATH)
