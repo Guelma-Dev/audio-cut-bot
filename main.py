@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import glob
 import json
 import logging
@@ -68,10 +69,10 @@ YOUTUBE_URL_RE = re.compile(
 )
 
 YOUTUBE_EXTRACTOR_ARGS_FAST = {
-    "youtube": {"player_client": ["android_vr"]}
+    "youtube": {"player_client": ["android_creator"]}
 }
 YOUTUBE_EXTRACTOR_ARGS_FULL = {
-    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
+    "youtube": {"player_client": ["android_creator", "tv", "web_safari", "web_embedded"]}
 }
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
