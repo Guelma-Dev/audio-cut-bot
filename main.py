@@ -711,26 +711,33 @@ def run_webhook_mode(application: Application | None) -> None:
 
 
 def run_polling_with_health(application: Application | None) -> None:
+    import asyncio
     import uvicorn
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
 
     web_app = FastAPI()
 
-    @web_app.on_event("startup")
-    async def _startup():
+    async def _start_bot() -> None:
         if application is None:
             logger.error("لا يوجد تطبيق بوت لبدء polling.")
             return
-        await application.initialize()
-        await application.start()
-        await application.updater.start_polling(
-            drop_pending_updates=True,
-            read_timeout=300,
-            write_timeout=300,
-            connect_timeout=20,
-        )
-        logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
+        try:
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                read_timeout=300,
+                write_timeout=300,
+                connect_timeout=20,
+            )
+            logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
+        except Exception:
+            logger.exception("فشل تشغيل البوت بوضع polling")
+
+    @web_app.on_event("startup")
+    async def _startup():
+        asyncio.create_task(_start_bot())
 
     @web_app.on_event("shutdown")
     async def _shutdown():
