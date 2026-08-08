@@ -704,17 +704,47 @@ def run_webhook_mode(application: Application) -> None:
     uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
 
 
+def run_polling_with_health(application: Application) -> None:
+    import uvicorn
+    from fastapi import FastAPI
+    from fastapi.responses import JSONResponse
+
+    web_app = FastAPI()
+
+    @web_app.on_event("startup")
+    async def _startup():
+        await application.initialize()
+        await application.start()
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            read_timeout=300,
+            write_timeout=300,
+            connect_timeout=20,
+        )
+        logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
+
+    @web_app.on_event("shutdown")
+    async def _shutdown():
+        await application.stop()
+        await application.shutdown()
+
+    @web_app.get("/healthz")
+    async def _healthz():
+        return JSONResponse({"status": "ok"})
+
+    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
+
+
 def main() -> None:
     if not BOT_TOKEN:
         logger.error("لم يتم تحديد BOT_TOKEN. اضبط متغير البيئة BOT_TOKEN أولاً ثم أعد التشغيل.")
-        return
 
     application = build_application()
 
     if WEBHOOK_URL:
         run_webhook_mode(application)
     else:
-        application.run_polling()
+        run_polling_with_health(application)
 
 
 if __name__ == "__main__":
