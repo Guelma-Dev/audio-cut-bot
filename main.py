@@ -63,6 +63,11 @@ elif os.getenv("COOKIES_TXT"):
 
 WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
 
+if COOKIES_FILE:
+    logger.info("تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, os.path.getsize(COOKIES_FILE))
+else:
+    logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
+
 YOUTUBE_URL_RE = re.compile(
     r"(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)"
     r"([A-Za-z0-9_-]{11})"
@@ -457,6 +462,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         info = await get_video_info(context.user_data["url"])
     except Exception as exc:
+        logger.exception("فشل جلب معلومات الفيديو (handle_url): %s", context.user_data["url"])
         await safe_edit(status, arabic_error(exc))
         return WAITING_FOR_URL
 
