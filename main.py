@@ -59,9 +59,8 @@ YOUTUBE_URL_RE = re.compile(
 )
 
 YOUTUBE_EXTRACTOR_ARGS = {
-    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
+    "youtube": {"player_client": ["android_vr"]}
 }
-YOUTUBE_REMOTE_COMPONENTS = {"ejs:github"}
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
 
@@ -151,7 +150,6 @@ async def get_video_info(url: str) -> dict:
             "skip_download": True,
             "js_runtimes": {"node": {}, "deno": {}},
             "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-            "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         }
         if COOKIES_FILE:
             options["cookiefile"] = COOKIES_FILE
@@ -201,6 +199,7 @@ async def download_audio(
     progress_hook=None,
     quality_kbps: int = 192,
     phase_cb=None,
+    info=None,
 ) -> str | None:
     def _run() -> str | None:
         is_full = start is None and end is None
@@ -216,7 +215,6 @@ async def download_audio(
                 "concurrent_fragment_downloads": 10,
                 "js_runtimes": {"node": {}, "deno": {}},
                 "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-                "remote_components": YOUTUBE_REMOTE_COMPONENTS,
         }
         if COOKIES_FILE:
             options["cookiefile"] = COOKIES_FILE
@@ -225,7 +223,10 @@ async def download_audio(
         if progress_hook:
             options["progress_hooks"] = [progress_hook]
         with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(url, download=True)
+            if info is not None:
+                ydl.process_ie_result(info, download=True)
+            else:
+                ydl.extract_info(url, download=True)
 
         matches = sorted(glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")))
         native = next((p for p in matches if not p.endswith(".part")), None)
@@ -446,6 +447,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     context.user_data["title"] = title
     context.user_data["duration"] = duration
+    context.user_data["video_info"] = info
 
     text = (
         f"تم التعرف على الفيديو:\n\n"
@@ -555,12 +557,14 @@ async def process(context: ContextTypes.DEFAULT_TYPE, status) -> None:
     start = context.user_data.get("start")
     end = context.user_data.get("end")
 
-    try:
-        info = await get_video_info(url)
-    except Exception as exc:
-        logger.exception("فشل جلب معلومات الفيديو")
-        await safe_edit(status, arabic_error(exc))
-        return
+    info = context.user_data.pop("video_info", None)
+    if info is None:
+        try:
+            info = await get_video_info(url)
+        except Exception as exc:
+            logger.exception("فشل جلب معلومات الفيديو")
+            await safe_edit(status, arabic_error(exc))
+            return
 
     duration = info.get("duration") or 0
     title = (info.get("title") or "مقطع صوتي").strip()
@@ -623,6 +627,7 @@ async def process(context: ContextTypes.DEFAULT_TYPE, status) -> None:
             progress_hook=progress_hook,
             quality_kbps=quality_kbps,
             phase_cb=phase_cb,
+            info=info,
         )
         if not final_path:
             raise RuntimeError("لم يتم إنشاء ملف الصوت النهائي.")
