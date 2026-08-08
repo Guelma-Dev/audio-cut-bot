@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -444,8 +445,17 @@ def _http_json(url: str, data: dict | None = None, files: dict | None = None,
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode())
+    except urllib.error.HTTPError as exc:
+        description = str(exc)
+        try:
+            body = json.loads(exc.read().decode())
+            description = body.get("description") or description
+        except Exception:
+            pass
+        raise RuntimeError(description)
 
 
 def tg(method: str, _timeout: int = 90, **params) -> object:
@@ -478,14 +488,16 @@ async def send_message(chat_id: int, text: str, reply_markup: dict | None = None
 
 
 async def edit_message(chat_id: int, message_id: int, text: str,
-                       reply_markup: dict | None = None) -> None:
+                       reply_markup: dict | None = None) -> bool:
     params = {"chat_id": chat_id, "message_id": message_id, "text": text}
     if reply_markup:
         params["reply_markup"] = json.dumps(reply_markup)
     try:
         await asyncio.to_thread(tg, "editMessageText", 90, **params)
+        return True
     except Exception as exc:
-        logger.warning("فشل تعديل الرسالة: %s", exc)
+        logger.warning("فشل تعديل الرسالة (%s): %s", message_id, exc)
+        return False
 
 
 async def answer_callback(query_id: str, text: str | None = None) -> None:
@@ -775,7 +787,10 @@ async def process_and_send(chat_id: int, session: dict, message: dict) -> None:
                         pct = int(done * 100 // total)
                         if pct // 10 > last_reported // 10:
                             last_reported = pct
-                            await edit_message(chat_id, status_id, f"جاري التنزيل... {pct}%")
+                            if status_id is None:
+                                continue
+                            if not await edit_message(chat_id, status_id, f"جاري التنزيل... {pct}%"):
+                                return
                 except queue.Empty:
                     pass
                 await asyncio.sleep(0.3)
