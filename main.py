@@ -8,22 +8,13 @@ import re
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import urllib.parse
+import urllib.request
 import uuid
 
 import yt_dlp
-from aiogram import Bot, Dispatcher, F, Router
-from aiogram.enums import ParseMode
-from aiogram.filters import Command, CommandStart
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    BufferedInputFile,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-    CallbackQuery,
-)
 
 # ---------------------------------------------------------------------------
 # الإعدادات من متغيرات البيئة
@@ -91,20 +82,7 @@ YDL_COMMON = {
 }
 
 # بيئة تشغيل JavaScript (Node.js) لحل تحديات توقيع nsig
-# نضيف node فقط لأن المتصفحات المتاحة في الحاوية محدودة
 YDL_COMMON["js_runtimes"] = {"node": {}}
-
-# ---------------------------------------------------------------------------
-# حالات محادثة FSM
-# ---------------------------------------------------------------------------
-class CutState(StatesGroup):
-    waiting_for_url = State()
-    waiting_for_time = State()
-
-
-router = Router()
-bot: Bot | None = None
-
 
 # ---------------------------------------------------------------------------
 # أدوات مساعدة
@@ -183,8 +161,7 @@ def cleanup(uid: str) -> None:
 
 
 def make_progress_hook(progress_q: "queue.Queue"):
-    """خطاف تقدم التنزيل: ينقل نسبة التقدم من خيط yt-dlp إلى قائمة آمنة
-    تقرأها حلقة asyncio لتحديث رسالة التقدم في تيليجرام."""
+    """خطاف تقدم التنزيل: ينقل نسبة التقدم من خيط yt-dlp إلى قائمة آمنة"""
     def hook(data: dict):
         try:
             if data.get("status") == "downloading":
@@ -206,8 +183,6 @@ def make_progress_hook(progress_q: "queue.Queue"):
 async def get_video_info(url: str) -> dict:
     def _fetch() -> dict:
         last_error: Exception | None = None
-        # العملاء الذين يعملون موثوقين: android_vr ثم ios ثم tv.
-        # (قائمة كاملة في extract_info مع download=True قد تعلق؛ هنا download=False)
         client_sets = [
             ["android_vr"],
             ["ios"],
@@ -429,84 +404,179 @@ def _encode_aac(
 
 
 # ---------------------------------------------------------------------------
+# واجهة Telegram Bot API عبر مكتبة Python القياسية فقط (لا حاجة لبناء أي شيء)
+# ---------------------------------------------------------------------------
+API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+def _http_json(url: str, data: dict | None = None, files: dict | None = None,
+               timeout: int = 90) -> dict:
+    if files:
+        boundary = uuid.uuid4().hex
+        body = bytearray()
+        for key, value in (data or {}).items():
+            body += (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode()
+        for key, (filename, content) in files.items():
+            body += (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="{key}"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: application/octet-stream\r\n\r\n"
+            ).encode()
+            body += content
+            body += b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        request = urllib.request.Request(
+            url,
+            data=bytes(body),
+            method="POST",
+            headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        )
+    else:
+        payload = urllib.parse.urlencode(data or {}).encode()
+        request = urllib.request.Request(
+            url,
+            data=payload,
+            method="POST",
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode())
+
+
+def tg(method: str, _timeout: int = 90, **params) -> object:
+    data = _http_json(f"{API_BASE}/{method}", data=params, timeout=_timeout)
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or "خطأ في Telegram API")
+    return data.get("result")
+
+
+def tg_audio(method: str, path: str, fields: dict, timeout: int = 300) -> object:
+    with open(path, "rb") as handle:
+        content = handle.read()
+    data = _http_json(
+        f"{API_BASE}/{method}",
+        data=fields,
+        files={"audio": (os.path.basename(path), content)},
+        timeout=timeout,
+    )
+    if not data.get("ok"):
+        raise RuntimeError(data.get("description") or "خطأ في إرسال الصوت")
+    return data.get("result")
+
+
+async def send_message(chat_id: int, text: str, reply_markup: dict | None = None) -> dict:
+    params = {"chat_id": chat_id, "text": text}
+    if reply_markup:
+        params["reply_markup"] = json.dumps(reply_markup)
+    result = await asyncio.to_thread(tg, "sendMessage", 90, **params)
+    return result or {}
+
+
+async def edit_message(chat_id: int, message_id: int, text: str,
+                       reply_markup: dict | None = None) -> None:
+    params = {"chat_id": chat_id, "message_id": message_id, "text": text}
+    if reply_markup:
+        params["reply_markup"] = json.dumps(reply_markup)
+    try:
+        await asyncio.to_thread(tg, "editMessageText", 90, **params)
+    except Exception as exc:
+        logger.warning("فشل تعديل الرسالة: %s", exc)
+
+
+async def answer_callback(query_id: str, text: str | None = None) -> None:
+    params = {"callback_query_id": query_id}
+    if text:
+        params["text"] = text
+    try:
+        await asyncio.to_thread(tg, "answerCallbackQuery", 90, **params)
+    except Exception:
+        pass
+
+
+async def delete_message(chat_id: int, message_id: int) -> None:
+    try:
+        await asyncio.to_thread(
+            tg, "deleteMessage", 90, chat_id=chat_id, message_id=message_id
+        )
+    except Exception:
+        pass
+
+
+async def send_audio(chat_id: int, path: str, title: str, caption: str,
+                     performer: str, filename: str) -> None:
+    fields = {
+        "chat_id": chat_id,
+        "title": title,
+        "caption": caption,
+        "performer": performer,
+    }
+    await asyncio.to_thread(tg_audio, "sendAudio", path, fields, 300)
+
+
+# ---------------------------------------------------------------------------
 # أزرار الاختيار السريع
 # ---------------------------------------------------------------------------
-def quick_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def quick_keyboard() -> dict:
+    return {
+        "inline_keyboard": [
             [
-                InlineKeyboardButton(text="أول 30 ثانية", callback_data="first30"),
-                InlineKeyboardButton(text="أول دقيقة", callback_data="first60"),
-                InlineKeyboardButton(text="الصوت كامل", callback_data="full"),
+                {"text": "أول 30 ثانية", "callback_data": "first30"},
+                {"text": "أول دقيقة", "callback_data": "first60"},
+                {"text": "الصوت كامل", "callback_data": "full"},
             ],
             [
-                InlineKeyboardButton(
-                    text="جودة: عالية", callback_data="quality:high"
-                ),
-                InlineKeyboardButton(
-                    text="جودة: متوسطة 128k", callback_data="quality:medium"
-                ),
-                InlineKeyboardButton(
-                    text="جودة: منخفضة 64k", callback_data="quality:low"
-                ),
+                {"text": "جودة: عالية", "callback_data": "quality:high"},
+                {"text": "جودة: متوسطة 128k", "callback_data": "quality:medium"},
+                {"text": "جودة: منخفضة 64k", "callback_data": "quality:low"},
             ],
             [
-                InlineKeyboardButton(text="إلغاء", callback_data="cancel"),
+                {"text": "إلغاء", "callback_data": "cancel"},
             ],
         ]
-    )
+    }
 
 
 # ---------------------------------------------------------------------------
-# معالجات الأوامر
+# جلسات المحادثة (بسيطة: قاموس لكل دردشة)
 # ---------------------------------------------------------------------------
-@router.message(CommandStart())
-async def cmd_start(message: Message, state: FSMContext) -> None:
-    if ALLOWED_USER_IDS and message.from_user.id not in ALLOWED_USER_IDS:
-        await message.answer("عذراً، هذا البوت غير متاح لك.")
-        return
-    await state.clear()
-    await message.answer(
-        "مرحباً بك في بوت قصّ الصوتيات من يوتيوب.\n\n"
-        "أرسل رابط فيديو يوتيوب لأرسل لك صوته بالشكل الذي تريده:\n"
-        "- قصّ جزء محدد بالتوقيت\n"
-        "- أو الصوت كاملاً"
-    )
-    await state.set_state(CutState.waiting_for_url)
+sessions: dict[int, dict] = {}
 
 
-@router.message(Command("cancel"))
-async def cmd_cancel(message: Message, state: FSMContext) -> None:
-    await state.clear()
-    await message.answer("تم إلغاء العملية. أرسل /start للبدء من جديد.")
-
-
-@router.message(CutState.waiting_for_url, F.text)
-async def handle_url(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
+async def handle_url(chat_id: int, session: dict, text: str) -> None:
     match = YOUTUBE_URL_RE.search(text)
     if not match:
-        await message.answer("هذا ليس رابط يوتيوب صحيح. حاول مجدداً.")
+        await send_message(chat_id, "هذا ليس رابط يوتيوب صحيح. حاول مجدداً.")
         return
 
     video_id = match.group(1)
     url = f"https://www.youtube.com/watch?v={video_id}"
-    await state.update_data(url=url, quality=DEFAULT_QUALITY)
+    session["url"] = url
+    session["quality"] = DEFAULT_QUALITY
 
-    status = await message.answer("جاري جلب معلومات الفيديو...")
+    status = await send_message(chat_id, "جاري جلب معلومات الفيديو...")
+    status_id = status.get("message_id")
     try:
         info = await get_video_info(url)
     except Exception as exc:
         logger.exception("فشل جلب معلومات الفيديو")
-        await status.edit_text(arabic_error(exc))
+        await edit_message(chat_id, status_id, arabic_error(exc))
         return
 
     title = (info.get("title") or "مقطع صوتي").strip()
     duration = info.get("duration") or 0
     channel = (info.get("channel") or "").strip()
-    await state.update_data(title=title, duration=duration)
+    session["title"] = title
+    session["duration"] = duration
+    session["state"] = "time"
 
-    await status.edit_text(
+    await edit_message(
+        chat_id,
+        status_id,
         f"تم التعرف على الفيديو:\n\n"
         f"العنوان: {title}\n"
         f"القناة: {channel or 'غير معروفة'}\n"
@@ -519,66 +589,13 @@ async def handle_url(message: Message, state: FSMContext) -> None:
         f"اختر جودة مختلفة بزر الجودة، أو اكتب: عالي / متوسط / منخفض",
         reply_markup=quick_keyboard(),
     )
-    await state.set_state(CutState.waiting_for_time)
 
 
-@router.callback_query(F.data == "cancel")
-async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
-    try:
-        await callback.message.edit_text("تم إلغاء العملية. أرسل /start للبدء من جديد.")
-    except Exception:
-        pass
-
-
-async def safe_answer(callback: CallbackQuery, text: str | None = None) -> None:
-    try:
-        await callback.answer(text)
-    except Exception:
-        pass
-
-
-@router.callback_query(F.data.startswith("quality:"))
-async def cb_quality(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
-    quality = callback.data.split(":", 1)[1]
-    if quality not in QUALITY_OPTIONS:
-        return
-    await state.update_data(quality=quality)
-    label = QUALITY_OPTIONS[quality]["label"]
-    await callback.message.answer(f"تم اختيار الجودة: {label}.")
-
-
-@router.callback_query(F.data.in_({"first30", "first60", "full"}))
-async def cb_quick(callback: CallbackQuery, state: FSMContext) -> None:
-    await safe_answer(callback)
-    data = await state.get_data()
-    if data.get("url") is None:
-        await state.clear()
-        await callback.message.answer("أرسل /start للبدء من جديد.")
-        return
-
-    if callback.data == "full":
-        await state.update_data(start=None, end=None)
-    elif callback.data == "first30":
-        await state.update_data(start=0, end=30)
-    elif callback.data == "first60":
-        await state.update_data(start=0, end=60)
-
-    try:
-        await callback.message.edit_text("جاري المعالجة...")
-    except Exception:
-        pass
-    await process_and_send(callback.message, state)
-
-
-@router.message(CutState.waiting_for_time, F.text)
-async def handle_time(message: Message, state: FSMContext) -> None:
-    text = message.text.strip()
-
+async def handle_time(chat_id: int, session: dict, message: dict, text: str) -> None:
     # إن أرسل رابطاً جديداً: نعيد ضبط الجلسة
     if YOUTUBE_URL_RE.search(text):
-        await handle_url(message, state)
+        session["state"] = "url"
+        await handle_url(chat_id, session, text)
         return
 
     quality_words = {
@@ -590,72 +607,157 @@ async def handle_time(message: Message, state: FSMContext) -> None:
     if clean in quality_words or clean.lower() in {"high", "medium", "low"}:
         quality = quality_words.get(clean, quality_words.get(clean.lower(), clean.lower()))
         if quality not in QUALITY_OPTIONS:
-            await message.answer("الجودة غير معروفة. الخيارات: عالي / متوسط / منخفض")
+            await send_message(chat_id, "الجودة غير معروفة. الخيارات: عالي / متوسط / منخفض")
             return
-        await state.update_data(quality=quality)
-        await message.answer(
-            f"تم اختيار الجودة: {QUALITY_OPTIONS[quality]['label']}. أرسل التوقيت الآن."
+        session["quality"] = quality
+        await send_message(
+            chat_id,
+            f"تم اختيار الجودة: {QUALITY_OPTIONS[quality]['label']}. أرسل التوقيت الآن.",
         )
         return
 
     if text.replace(" ", "").lower() in ("كامل", "كل", "full", "all"):
-        await state.update_data(start=None, end=None)
-        await process_and_send(message, state)
+        session["start"] = None
+        session["end"] = None
+        await process_and_send(chat_id, session, message)
         return
 
     tokens = [token for token in re.split(r"[\s\-–—,]+", text) if token]
     if len(tokens) != 2:
-        await message.answer("لم أفهم التوقيت. أرسله بهذا الشكل:\nمثال: 01:30 - 04:15")
+        await send_message(chat_id, "لم أفهم التوقيت. أرسله بهذا الشكل:\nمثال: 01:30 - 04:15")
         return
 
     start, end = parse_time(tokens[0]), parse_time(tokens[1])
     if start is None or end is None:
-        await message.answer("صيغة الأوقات غير صحيحة. استخدم MM:SS أو HH:MM:SS")
+        await send_message(chat_id, "صيغة الأوقات غير صحيحة. استخدم MM:SS أو HH:MM:SS")
         return
     if end <= start:
-        await message.answer("وقت النهاية يجب أن يكون أكبر من وقت البداية.")
+        await send_message(chat_id, "وقت النهاية يجب أن يكون أكبر من وقت البداية.")
         return
 
-    data = await state.get_data()
-    duration = data.get("duration") or 0
+    duration = session.get("duration") or 0
     if duration and end > duration:
-        await message.answer(
-            f"وقت النهاية ({format_time(end)}) يتجاوز مدة الفيديو ({format_time(duration)})."
+        await send_message(
+            chat_id,
+            f"وقت النهاية ({format_time(end)}) يتجاوز مدة الفيديو ({format_time(duration)}).",
         )
         return
     if end - start > MAX_SEGMENT_SECONDS:
-        await message.answer(
-            f"المقطع المطلوب أطول من المسموح (الحد الأقصى {MAX_SEGMENT_SECONDS // 3600} ساعة)."
+        await send_message(
+            chat_id,
+            f"المقطع المطلوب أطول من المسموح (الحد الأقصى {MAX_SEGMENT_SECONDS // 3600} ساعة).",
         )
         return
 
-    await state.update_data(start=start, end=end)
-    await process_and_send(message, state)
+    session["start"] = start
+    session["end"] = end
+    await process_and_send(chat_id, session, message)
+
+
+async def handle_callback(chat_id: int, callback: dict) -> None:
+    data = callback.get("data", "")
+    query_id = callback.get("id")
+    message = callback.get("message") or {}
+    message_id = message.get("message_id")
+    session = sessions.get(chat_id)
+
+    if data == "cancel":
+        if session is not None:
+            session.clear()
+        await edit_message(chat_id, message_id, "تم إلغاء العملية. أرسل /start للبدء من جديد.")
+        return
+
+    if data.startswith("quality:"):
+        await answer_callback(query_id)
+        quality = data.split(":", 1)[1]
+        if quality not in QUALITY_OPTIONS or session is None:
+            return
+        session["quality"] = quality
+        await send_message(chat_id, f"تم اختيار الجودة: {QUALITY_OPTIONS[quality]['label']}.")
+        return
+
+    if data in {"first30", "first60", "full"}:
+        await answer_callback(query_id)
+        if session is None or not session.get("url"):
+            await send_message(chat_id, "أرسل /start للبدء من جديد.")
+            return
+        if data == "full":
+            session["start"] = None
+            session["end"] = None
+        elif data == "first30":
+            session["start"] = 0
+            session["end"] = 30
+        elif data == "first60":
+            session["start"] = 0
+            session["end"] = 60
+        await edit_message(chat_id, message_id, "جاري المعالجة...")
+        await process_and_send(chat_id, session, message)
+
+
+async def handle_message(message: dict) -> None:
+    chat_id = message.get("chat", {}).get("id")
+    if chat_id is None:
+        return
+    user_id = message.get("from", {}).get("id")
+    if ALLOWED_USER_IDS and user_id not in ALLOWED_USER_IDS:
+        await send_message(chat_id, "عذراً، هذا البوت غير متاح لك.")
+        return
+
+    text = (message.get("text") or "").strip()
+    session = sessions.setdefault(chat_id, {"state": "idle"})
+
+    if text == "/start":
+        session.clear()
+        session["state"] = "url"
+        await send_message(
+            chat_id,
+            "مرحباً بك في بوت قصّ الصوتيات من يوتيوب.\n\n"
+            "أرسل رابط فيديو يوتيوب لأرسل لك صوته بالشكل الذي تريده:\n"
+            "- قصّ جزء محدد بالتوقيت\n"
+            "- أو الصوت كاملاً",
+        )
+        return
+    if text == "/cancel":
+        session.clear()
+        session["state"] = "idle"
+        await send_message(chat_id, "تم إلغاء العملية. أرسل /start للبدء من جديد.")
+        return
+
+    if session.get("state") == "url":
+        await handle_url(chat_id, session, text)
+    elif session.get("state") == "time":
+        await handle_time(chat_id, session, message, text)
+    elif YOUTUBE_URL_RE.search(text):
+        session["state"] = "url"
+        await handle_url(chat_id, session, text)
+    else:
+        await send_message(chat_id, "أرسل /start للبدء.")
 
 
 # ---------------------------------------------------------------------------
 # المعالجة والإرسال
 # ---------------------------------------------------------------------------
-async def process_and_send(message: Message, state: FSMContext) -> None:
-    data = await state.get_data()
-    url = data.get("url")
+async def process_and_send(chat_id: int, session: dict, message: dict) -> None:
+    url = session.get("url")
     if not url:
-        await state.clear()
-        await message.answer("أرسل /start للبدء من جديد.")
+        session.clear()
+        await send_message(chat_id, "أرسل /start للبدء من جديد.")
         return
 
-    title = (data.get("title") or "مقطع صوتي").strip()
-    start = data.get("start")
-    end = data.get("end")
-    quality = data.get("quality", DEFAULT_QUALITY)
+    title = (session.get("title") or "مقطع صوتي").strip()
+    start = session.get("start")
+    end = session.get("end")
+    quality = session.get("quality", DEFAULT_QUALITY)
     if quality not in QUALITY_OPTIONS:
         quality = DEFAULT_QUALITY
 
-    status = await message.answer(
+    status = await send_message(
+        chat_id,
         f"جاري تنزيل الصوت وقصّه (جودة: {QUALITY_OPTIONS[quality]['label']})..."
         if start is not None
-        else f"جاري تنزيل الصوت كاملاً (جودة: {QUALITY_OPTIONS[quality]['label']})..."
+        else f"جاري تنزيل الصوت كاملاً (جودة: {QUALITY_OPTIONS[quality]['label']})...",
     )
+    status_id = status.get("message_id")
 
     uid = uuid.uuid4().hex
     try:
@@ -673,12 +775,7 @@ async def process_and_send(message: Message, state: FSMContext) -> None:
                         pct = int(done * 100 // total)
                         if pct // 10 > last_reported // 10:
                             last_reported = pct
-                            try:
-                                await status.edit_text(
-                                    f"جاري التنزيل... {pct}%"
-                                )
-                            except Exception:
-                                pass
+                            await edit_message(chat_id, status_id, f"جاري التنزيل... {pct}%")
                 except queue.Empty:
                     pass
                 await asyncio.sleep(0.3)
@@ -688,9 +785,11 @@ async def process_and_send(message: Message, state: FSMContext) -> None:
             path = await asyncio.wait_for(process_task, timeout=PROCESS_TIMEOUT)
         except asyncio.TimeoutError:
             process_task.cancel()
-            await status.edit_text(
+            await edit_message(
+                chat_id,
+                status_id,
                 "انتهت مهلة المعالجة (الشبكة بطيئة أو يوتيوب يعرقل التنزيل).\n"
-                "جرّب مقطعاً أقصر أو جودة أقل."
+                "جرّب مقطعاً أقصر أو جودة أقل.",
             )
             return
         finally:
@@ -699,29 +798,26 @@ async def process_and_send(message: Message, state: FSMContext) -> None:
             raise RuntimeError("لم يتم إنشاء ملف الصوت.")
 
         if os.path.getsize(path) > MAX_UPLOAD_BYTES:
-            await status.edit_text(
+            await edit_message(
+                chat_id,
+                status_id,
                 "حجم الملف الناتج يتجاوز حد الإرسال في تيليغرام (50MB).\n"
-                "جرّب مقطعاً أقصر."
+                "جرّب مقطعاً أقصر.",
             )
             return
 
-        await status.edit_text("جاري إرسال الملف...")
+        await edit_message(chat_id, status_id, "جاري إرسال الملف...")
         if start is not None:
             segment_label = f"{format_time(start)} - {format_time(end)}"
         else:
             segment_label = "كامل"
         caption = f"{title}\nالتوقيت: {segment_label}"
+        filename = f"{title[:40]}_{segment_label}.m4a"
 
         # إرسال كـ Audio وليس Document
         for attempt in range(3):
             try:
-                with open(path, "rb") as audio_file:
-                    await message.answer_audio(
-                        audio=BufferedInputFile(audio_file.read(), filename=f"{title[:40]}_{segment_label}.m4a"),
-                        title=title,
-                        caption=caption,
-                        performer="YouTube",
-                    )
+                await send_audio(chat_id, path, title, caption, "YouTube", filename)
                 break
             except Exception as exc:
                 logger.warning("فشل الإرسال (محاولة %d): %s", attempt + 1, exc)
@@ -730,60 +826,85 @@ async def process_and_send(message: Message, state: FSMContext) -> None:
                 else:
                     raise
 
-        try:
-            await status.delete()
-        except Exception:
-            pass
+        await delete_message(chat_id, status_id)
     except Exception as exc:
         logger.exception("فشل معالجة المقطع")
-        await status.edit_text(arabic_error(exc))
+        await edit_message(chat_id, status_id, arabic_error(exc))
     finally:
         cleanup(uid)
-        await state.clear()
+        session.clear()
 
 
 # ---------------------------------------------------------------------------
-# خادم ويب خفيف /ping لمنع نوم الحاوية
+# حلقة الاستطلاع (polling)
 # ---------------------------------------------------------------------------
-async def ping_server() -> None:
-    from aiohttp import web
+async def polling_loop() -> None:
+    offset = 0
+    while True:
+        try:
+            updates = await asyncio.to_thread(
+                tg, "getUpdates", 100, offset=offset, timeout=50
+            )
+        except Exception as exc:
+            logger.warning("فشل جلب التحديثات: %s", exc)
+            await asyncio.sleep(3)
+            continue
+        for update in updates:
+            offset = max(offset, int(update.get("update_id", 0)) + 1)
+            try:
+                if "message" in update:
+                    await handle_message(update["message"])
+                elif "callback_query" in update:
+                    cq = update["callback_query"]
+                    chat_id = (cq.get("message") or {}).get("chat", {}).get("id")
+                    if chat_id is not None:
+                        await handle_callback(chat_id, cq)
+            except Exception as exc:
+                logger.exception("خطأ في معالجة التحديث: %s", exc)
 
-    async def ping(request):
-        return web.Response(text="ok")
 
-    app = web.Application()
-    app.router.add_get("/ping", ping)
-    app.router.add_get("/healthz", ping)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
-    logger.info("خادم /ping يعمل على المنفذ %s", PORT)
+# ---------------------------------------------------------------------------
+# خادم ويب خفيف /ping لمنع نوم الحاوية (اختياري؛ يتجاهل فشل التشغيل)
+# ---------------------------------------------------------------------------
+def run_ping_server() -> None:
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain")
+            self.end_headers()
+            try:
+                self.wfile.write(b"ok")
+            except Exception:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    try:
+        httpd = HTTPServer(("0.0.0.0", PORT), Handler)
+        httpd.serve_forever()
+    except Exception as exc:
+        logger.warning("تعذر تشغيل خادم /ping على المنفذ %s: %s", PORT, exc)
 
 
 # ---------------------------------------------------------------------------
 # نقطة الدخول
 # ---------------------------------------------------------------------------
-async def main() -> None:
-    global bot
+def main() -> None:
     if not BOT_TOKEN:
         logger.error("لا يوجد BOT_TOKEN. اضبط متغير البيئة.")
         sys.exit(1)
 
-    bot = Bot(token=BOT_TOKEN)
-    dp = Dispatcher()
-    dp.include_router(router)
+    threading.Thread(target=run_ping_server, daemon=True).start()
 
-    # خادم /ping بالتوازي مع البوت
-    asyncio.create_task(ping_server())
-
-    # بدء الاستطلاع (polling) — يبقي البوت حياً دائماً
     logger.info("بدء تشغيل البوت بوضع polling...")
-    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
+    try:
+        asyncio.run(polling_loop())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("تم إيقاف البوت.")
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("تم إيقاف البوت.")
+    main()

@@ -8,9 +8,9 @@ pkg update -y && pkg upgrade -y
 echo "=== تثبيت الأدوات ==="
 pkg install -y python ffmpeg nodejs-lts git
 
-echo "=== تثبيت مكتبات البوت ==="
+echo "=== تثبيت مكتبة البوت (yt-dlp فقط - لا حاجة لبناء أي شيء) ==="
 pip install --upgrade pip
-pip install aiogram yt-dlp aiohttp
+pip install yt-dlp
 
 echo "=== تنزيل ملف البوت تلقائياً ==="
 mkdir -p ~/audiobot
