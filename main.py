@@ -716,6 +716,62 @@ def run_webhook_mode(application: Application | None) -> None:
     async def _healthz():
         return JSONResponse({"status": "ok"})
 
+    @web_app.get("/diag")
+    async def _diag():
+        import urllib.request
+
+        result: dict = {}
+
+        try:
+            with urllib.request.urlopen(
+                "https://api.ipify.org", timeout=15
+            ) as resp:
+                result["outbound_ip"] = resp.read().decode().strip()
+        except Exception as exc:
+            result["outbound_ip"] = f"error: {exc}"
+
+        try:
+            with urllib.request.urlopen(
+                "https://ipwho.is/" + result.get("outbound_ip", ""), timeout=15
+            ) as resp:
+                ipinfo = json.loads(resp.read().decode())
+                result["asn"] = ipinfo.get("connection", {}).get("asn")
+                result["org"] = ipinfo.get("connection", {}).get("org")
+                result["isp"] = ipinfo.get("connection", {}).get("isp")
+        except Exception as exc:
+            result["ipinfo_error"] = str(exc)
+
+        result["yt_dlp_version"] = yt_dlp.version.__version__
+        result["cookies_loaded"] = bool(COOKIES_FILE)
+
+        def _test_yt(url: str, player_client: str, use_cookies: bool) -> str:
+            options = {
+                "quiet": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "js_runtimes": {"node": {}},
+                "extractor_args": {
+                    "youtube": {"player_client": [player_client]}
+                },
+            }
+            if use_cookies and COOKIES_FILE:
+                options["cookiefile"] = COOKIES_FILE
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    info = ydl.extract_info(url, download=False)
+                return f"OK formats={len(info.get('formats', []))}"
+            except Exception as exc:
+                return f"FAIL: {underlying_error(exc)[:180]}"
+
+        url = "https://www.youtube.com/watch?v=rupFLbOkioQ"
+        result["test_android_vr_no_cookies"] = _test_yt(
+            url, "android_vr", False
+        )
+        result["test_android_vr_with_cookies"] = _test_yt(
+            url, "android_vr", True
+        )
+        return JSONResponse(result)
+
     @web_app.post(WEBHOOK_PATH)
     async def _webhook(request: Request):
         if application is None:
