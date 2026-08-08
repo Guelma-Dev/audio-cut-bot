@@ -818,27 +818,40 @@ def run_webhook_mode(application: Application | None) -> None:
     async def _diag():
         import asyncio
         results = {}
+        cookie_ok = False
+        try:
+            cookie_ok = os.path.isfile(COOKIES_FILE) and "SID" in open(COOKIES_FILE).read()
+        except Exception:
+            pass
+        results["cookies_sid"] = str(cookie_ok)
+        clients = {
+            "mweb": ["mweb"],
+            "web_safari": ["web_safari"],
+            "web_embedded": ["web_embedded"],
+            "tv": ["tv"],
+            "web": ["web"],
+        }
         for label, url in [
             ("normal_video", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
             ("age_gated", "https://www.youtube.com/watch?v=rupFLbOkioQ"),
-            ("another", "https://www.youtube.com/watch?v=0v7_LnjVlBM"),
         ]:
-            def _try(url=url):
-                opts = base_ytdlp_options()
-                opts.update({
-                    "quiet": True,
-                    "noplaylist": True,
-                    "skip_download": True,
-                    "extractor_args": YOUTUBE_EXTRACTOR_ARGS_POT,
-                })
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            try:
-                info = await asyncio.to_thread(_try)
-                fmts = info.get("formats") or []
-                results[label] = f"OK title={info.get('title')!r} formats={len(fmts)} with_url={sum(1 for f in fmts if f.get('url'))}"
-            except Exception as exc:
-                results[label] = f"FAIL {str(exc)[:150]}"
+            for cname, c in clients.items():
+                def _try(url=url, c=c):
+                    opts = base_ytdlp_options()
+                    opts.update({
+                        "quiet": True,
+                        "noplaylist": True,
+                        "skip_download": True,
+                        "extractor_args": {"youtube": {"player_client": c}},
+                    })
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(url, download=False)
+                try:
+                    info = await asyncio.wait_for(asyncio.to_thread(_try), timeout=25)
+                    fmts = info.get("formats") or []
+                    results[f"{cname}@{label}"] = f"OK fmts={len(fmts)} url={sum(1 for f in fmts if f.get('url'))}"
+                except Exception as exc:
+                    results[f"{cname}@{label}"] = f"FAIL {str(exc)[:90]}"
         return JSONResponse(results)
 
     @web_app.post(WEBHOOK_PATH)
