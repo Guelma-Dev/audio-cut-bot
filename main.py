@@ -629,6 +629,9 @@ async def handle_time(chat_id: int, session: dict, message: dict, text: str) -> 
         return
 
     if text.replace(" ", "").lower() in ("كامل", "كل", "full", "all"):
+        if session.get("processing"):
+            await send_message(chat_id, "جاري المعالجة بالفعل، انتظر قليلاً...")
+            return
         session["start"] = None
         session["end"] = None
         await process_and_send(chat_id, session, message)
@@ -663,6 +666,9 @@ async def handle_time(chat_id: int, session: dict, message: dict, text: str) -> 
 
     session["start"] = start
     session["end"] = end
+    if session.get("processing"):
+        await send_message(chat_id, "جاري المعالجة بالفعل، انتظر قليلاً...")
+        return
     await process_and_send(chat_id, session, message)
 
 
@@ -689,9 +695,11 @@ async def handle_callback(chat_id: int, callback: dict) -> None:
         return
 
     if data in {"first30", "first60", "full"}:
-        await answer_callback(query_id)
         if session is None or not session.get("url"):
             await send_message(chat_id, "أرسل /start للبدء من جديد.")
+            return
+        if session.get("processing"):
+            await answer_callback(query_id, "جاري المعالجة بالفعل، انتظر قليلاً...")
             return
         if data == "full":
             session["start"] = None
@@ -702,7 +710,8 @@ async def handle_callback(chat_id: int, callback: dict) -> None:
         elif data == "first60":
             session["start"] = 0
             session["end"] = 60
-        await edit_message(chat_id, message_id, "جاري المعالجة...")
+        # نزيل رسالة الأزرار فوراً حتى لا يتم الضغط عليها مرتين
+        await delete_message(chat_id, message_id)
         await process_and_send(chat_id, session, message)
 
 
@@ -772,6 +781,7 @@ async def process_and_send(chat_id: int, session: dict, message: dict) -> None:
     status_id = status.get("message_id")
 
     uid = uuid.uuid4().hex
+    session["processing"] = True
     try:
         progress_q: queue.Queue = queue.Queue()
         process_task = asyncio.create_task(
