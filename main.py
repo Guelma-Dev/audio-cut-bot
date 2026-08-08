@@ -95,7 +95,7 @@ else:
     logger.info("لم يتم تحميل أي كوكيز (COOKIES_FILE فارغ)")
 
 
-def base_ytdlp_options() -> dict:
+def base_ytdlp_options(use_cookies: bool = True) -> dict:
     options = {"quiet": True, "noplaylist": True, "js_runtimes": {"node": {}, "deno": {}}}
     if DENO_PATH:
         options["js_runtimes"]["deno"]["path"] = DENO_PATH
@@ -103,7 +103,7 @@ def base_ytdlp_options() -> dict:
         options.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
             "base_url": "http://127.0.0.1:4416"
         }
-    if COOKIES_FILE:
+    if use_cookies and COOKIES_FILE:
         options["cookiefile"] = COOKIES_FILE
     return options
 
@@ -825,19 +825,19 @@ def run_webhook_mode(application: Application | None) -> None:
             pass
         results["cookies_sid"] = str(cookie_ok)
         clients = {
-            "mweb": ["mweb"],
-            "web_safari": ["web_safari"],
-            "web_embedded": ["web_embedded"],
-            "tv": ["tv"],
-            "web": ["web"],
+            "mweb_nocookies": (["mweb"], False),
+            "mweb": (["mweb"], True),
+            "web_safari": (["web_safari"], True),
+            "tv": (["tv"], True),
+            "tv_nocookies": (["tv"], False),
         }
         for label, url in [
             ("normal_video", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
             ("age_gated", "https://www.youtube.com/watch?v=rupFLbOkioQ"),
         ]:
-            for cname, c in clients.items():
-                def _try(url=url, c=c):
-                    opts = base_ytdlp_options()
+            for cname, (c, use_cookies) in clients.items():
+                def _try(url=url, c=c, use_cookies=use_cookies):
+                    opts = base_ytdlp_options(use_cookies=use_cookies)
                     opts.update({
                         "quiet": True,
                         "noplaylist": True,
