@@ -1,94 +1,119 @@
 import asyncio
-import base64
 import glob
 import json
 import logging
 import os
+import queue
 import re
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
 
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    ConversationHandler,
-    MessageHandler,
-    filters,
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.enums import ParseMode
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    BufferedInputFile,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    CallbackQuery,
 )
 
+# ---------------------------------------------------------------------------
+# الإعدادات من متغيرات البيئة
+# ---------------------------------------------------------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
+ALLOWED_USER_IDS = {
+    int(uid)
+    for uid in os.getenv("ALLOWED_USER_IDS", "").split(",")
+    if uid.strip()
+}
 MAX_SEGMENT_SECONDS = int(os.getenv("MAX_SEGMENT_SECONDS", "7200"))
 MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(50 * 1024 * 1024)))
-AUDIO_QUALITY = os.getenv("AUDIO_QUALITY", "192")
+PROCESS_TIMEOUT = int(os.getenv("PROCESS_TIMEOUT", "180"))
 TEMP_DIR = os.environ.get("TEMP_DIR") or tempfile.gettempdir()
-FFMPEG_LOCATION = os.getenv("FFMPEG_LOCATION", "")
-ALLOWED_USER_IDS = {
-    int(user_id)
-    for user_id in os.getenv("ALLOWED_USER_IDS", "").split(",")
-    if user_id.strip()
-}
-
-WEBHOOK_URL = os.getenv("WEBHOOK_URL", "")
-WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", "/telegram-webhook")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
 PORT = int(os.getenv("PORT", "8080"))
 
-BOT_API_URL = os.getenv("BOT_API_URL", "https://api.telegram.org/bot")
-BOT_API_FILE_URL = os.getenv("BOT_API_FILE_URL", "https://api.telegram.org/file/bot")
+# خيارات الجودة المتاحة
+QUALITY_OPTIONS = {
+    "high": {"label": "عالية (أفضل جودة)", "bitrate": None},
+    "medium": {"label": "متوسطة (128k)", "bitrate": 128},
+    "low": {"label": "منخفضة (64k)", "bitrate": 64},
+}
+DEFAULT_QUALITY = "high"
 
-COOKIES_FILE = ""
-COOKIES_BYTES = 0
-_cookies_b64 = os.getenv("COOKIES_TXT_B64", "")
-if _cookies_b64:
-    _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
-    try:
-        with open(_cookies_path, "wb") as _f:
-            _f.write(base64.b64decode(_cookies_b64))
-        COOKIES_FILE = _cookies_path
-        COOKIES_BYTES = os.path.getsize(_cookies_path)
-    except Exception:
-        COOKIES_FILE = ""
-elif os.getenv("COOKIES_TXT"):
-    _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
-    try:
-        with open(_cookies_path, "w", encoding="utf-8") as _f:
-            _f.write(os.getenv("COOKIES_TXT"))
-        COOKIES_FILE = _cookies_path
-        COOKIES_BYTES = os.path.getsize(_cookies_path)
-    except OSError:
-        COOKIES_FILE = ""
-
-WAITING_FOR_URL, WAITING_FOR_TIME = range(2)
-
-YOUTUBE_URL_RE = re.compile(
-    r"(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)"
-    r"([A-Za-z0-9_-]{11})"
-)
-
-# android_vr يعمل بدون كوكيز على الفيديوهات العادية حتى من خوادم مركز البيانات.
-# العملاء الأخرى تحتاج كوكيز صالحة؛ نمررها فقط عند الحاجة.
-PLAYER_CLIENTS_NO_COOKIES = ["android_vr", "ios"]
-PLAYER_CLIENTS_WITH_COOKIES = ["tv", "web_safari", "web_embedded"]
-
-TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
-
+# ---------------------------------------------------------------------------
+# سجل الأحداث
+# ---------------------------------------------------------------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
-if COOKIES_FILE:
-    logger.info(
-        "تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, COOKIES_BYTES
-    )
-else:
-    logger.info("لم يتم تحميل ملف الكوكيز — سيُستخدم عميل android_vr بدون كوكيز.")
+
+# ---------------------------------------------------------------------------
+# مسارات وأدوات النظام
+# ---------------------------------------------------------------------------
+FFMPEG = os.getenv("FFMPEG_LOCATION", "ffmpeg")
+
+# ---------------------------------------------------------------------------
+# إعدادات yt-dlp المصممة لتجاوز حجب مراكز البيانات قدر الإمكان
+# ---------------------------------------------------------------------------
+# استخدام عدة عملاء مختلفي المنصات بالتناوب: tv، ios، android_vr، web_safari.
+# عند فشل أحدهم ينتقل تلقائياً للتالي. تجربة عملاء أندرويد/iOS عادةً تتفادى
+# فحص المتصفح الذي يطبقه YouTube على العملاء الويب.
+YDL_COMMON = {
+    "quiet": True,
+    "no_warnings": True,
+    "noplaylist": True,
+    "skip_download": False,
+    "retries": 5,
+    "fragment_retries": 5,
+    "socket_timeout": 60,
+    "concurrent_fragment_downloads": 10,
+    "extractor_args": {
+        "youtube": {
+            "player_client": [
+                "tv",
+                "ios",
+                "android_vr",
+                "web_safari",
+                "web_embedded",
+            ],
+        }
+    },
+}
+
+# بيئة تشغيل JavaScript (Node.js) لحل تحديات توقيع nsig
+# نضيف node فقط لأن المتصفحات المتاحة في الحاوية محدودة
+YDL_COMMON["js_runtimes"] = {"node": {}}
+
+# ---------------------------------------------------------------------------
+# حالات محادثة FSM
+# ---------------------------------------------------------------------------
+class CutState(StatesGroup):
+    waiting_for_url = State()
+    waiting_for_time = State()
+
+
+router = Router()
+bot: Bot | None = None
+
+
+# ---------------------------------------------------------------------------
+# أدوات مساعدة
+# ---------------------------------------------------------------------------
+YOUTUBE_URL_RE = re.compile(
+    r"(?:youtube\.com\/(?:watch\?(?:.*&)?v=|shorts\/|embed\/|live\/)|youtu\.be\/)"
+    r"([A-Za-z0-9_-]{11})"
+)
+TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
 
 
 def parse_time(value: str) -> int | None:
@@ -107,10 +132,6 @@ def format_time(seconds: int) -> str:
     return f"{minutes:02d}:{secs:02d}"
 
 
-def estimate_mp3_size(seconds: int, quality_kbps: int = 192) -> int:
-    return int(seconds * quality_kbps * 1000 / 8)
-
-
 def underlying_error(exc: Exception) -> str:
     info = getattr(exc, "exc_info", None)
     if info and len(info) > 1 and info[1] is not None:
@@ -125,206 +146,32 @@ def underlying_error(exc: Exception) -> str:
 
 def arabic_error(exc: Exception) -> str:
     message = underlying_error(exc).lower()
+    if "sign in to confirm" in message:
+        return (
+            "يوتيوب يطلب تأكيد هوية بشرية (رobot check). "
+            "يحدث هذا غالباً عندما يكون IP الخادم محظوراً من يوتيوب."
+        )
+    if "requested format" in message or "format is not available" in message:
+        return "الصيغة المطلوبة غير متاحة لهذا الفيديو."
     if "private" in message or "members-only" in message:
-        return "هذا الفيديو خاص أو للأعضاء فقط ولا يمكن الوصول إليه."
-    if "video unavailable" in message or "not available" in message or "removed" in message:
-        return "هذا الفيديو غير متاح (قد يكون محذوفاً أو محظوراً في بلدك)."
-    if "sign in to confirm" in message or "age-restricted" in message:
-        return "هذا الفيديو يتطلب تسجيل الدخول لتأكيد العمر ولا يمكن تنزيله."
+        return "هذا الفيديو خاص أو للأعضاء فقط."
+    if "video unavailable" in message or "removed" in message:
+        return "هذا الفيديو غير متاح (محذوف أو محظور في بلدك)."
+    if "age-restricted" in message:
+        return "هذا الفيديو مقيد بالعمر."
     if "copyright" in message:
         return "تمت إزالة هذا الفيديو بسبب حقوق النشر."
     if "live stream" in message or "is live" in message:
         return "لا يمكن قصّ البث المباشر بهذه الطريقة."
-    if (
-        "timeout" in message
-        or "timed out" in message
-        or "unable to download" in message
-        or "connection" in message
-    ):
-        return "فشل الاتصال بالخادم. حاول مرة أخرى بعد قليل."
-    return "حدث خطأ غير متوقع. حاول مرة أخرى بعد قليل."
-
-
-async def safe_edit(message, text: str) -> None:
-    try:
-        await message.edit_text(text)
-    except Exception:
-        pass
-
-
-async def get_video_info(url: str) -> dict:
-    def _fetch() -> dict:
-        last_error: Exception | None = None
-        strategies = [
-            (PLAYER_CLIENTS_NO_COOKIES, False),
-            (PLAYER_CLIENTS_WITH_COOKIES, True),
-        ]
-        for clients, use_cookies in strategies:
-            options = {
-                "quiet": True,
-                "noplaylist": True,
-                "skip_download": True,
-                "js_runtimes": {"node": {}},
-                "extractor_args": {"youtube": {"player_client": clients}},
-            }
-            if use_cookies and COOKIES_FILE:
-                options["cookiefile"] = COOKIES_FILE
-            try:
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    return ydl.extract_info(url, download=False)
-            except Exception as exc:
-                last_error = exc
-                logger.warning(
-                    "فشل جلب معلومات الفيديو بالعملاء %s (كوكيز=%s): %s",
-                    clients, use_cookies, underlying_error(exc),
-                )
-        raise last_error or RuntimeError("فشل جلب معلومات الفيديو بكل المحاولات")
-
-    return await asyncio.to_thread(_fetch)
-
-
-def build_progress_hook(status, loop):
-    last_update = {"time": 0.0}
-
-    async def _edit(percent: str):
-        await safe_edit(status, f"جاري تنزيل الصوت من يوتيوب...\nاكتمل: {percent}")
-
-    def hook(data: dict) -> None:
-        if data.get("status") != "downloading":
-            return
-        now = time.monotonic()
-        if now - last_update["time"] < 3:
-            return
-        last_update["time"] = now
-        percent = (data.get("_percent_str") or "0%").strip()
-        asyncio.run_coroutine_threadsafe(_edit(percent), loop)
-
-    return hook
-
-
-def build_phase_editor(status, loop):
-    def edit(text: str) -> None:
-        asyncio.run_coroutine_threadsafe(safe_edit(status, text), loop)
-
-    return edit
+    if "timeout" in message or "timed out" in message:
+        return "انتهت مهلة الاتصال. حاول مرة أخرى."
+    return f"حدث خطأ: {underlying_error(exc)[:200]}"
 
 
 def ffmpeg_bin() -> str:
-    if FFMPEG_LOCATION:
-        return os.path.join(FFMPEG_LOCATION, "ffmpeg")
-    return "ffmpeg"
-
-
-async def download_audio(
-    url: str,
-    uid: str,
-    start: int | None = None,
-    end: int | None = None,
-    progress_hook=None,
-    quality_kbps: int = 192,
-    phase_cb=None,
-) -> str | None:
-    def _run() -> str | None:
-        is_full = start is None and end is None
-        options = {
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
-            "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
-            "noplaylist": True,
-            "quiet": True,
-            "no_warnings": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "socket_timeout": 60,
-            "concurrent_fragment_downloads": 10,
-            "js_runtimes": {"node": {}},
-            "extractor_args": {
-                "youtube": {"player_client": PLAYER_CLIENTS_NO_COOKIES}
-            },
-        }
-        if FFMPEG_LOCATION:
-            options["ffmpeg_location"] = FFMPEG_LOCATION
-        if progress_hook:
-            options["progress_hooks"] = [progress_hook]
-        with yt_dlp.YoutubeDL(options) as ydl:
-            ydl.extract_info(url, download=True)
-
-        matches = sorted(glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")))
-        native = next((p for p in matches if not p.endswith(".part")), None)
-        if not native:
-            return None
-
-        if is_full:
-            if os.path.getsize(native) > MAX_UPLOAD_BYTES:
-                if phase_cb:
-                    phase_cb("تم تنزيل الصوت (100%). جاري تحويله إلى MP3 لضغط الحجم...")
-                mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
-                subprocess.run(
-                    [
-                        ffmpeg_bin(),
-                        "-y",
-                        "-i",
-                        native,
-                        "-codec:a",
-                        "libmp3lame",
-                        "-b:a",
-                        f"{quality_kbps}k",
-                        mp3_path,
-                    ],
-                    check=True,
-                    capture_output=True,
-                )
-                os.remove(native)
-                return mp3_path
-            if os.path.splitext(native)[1].lower() == ".webm":
-                m4a_path = os.path.join(TEMP_DIR, f"{uid}.m4a")
-                try:
-                    subprocess.run(
-                        [
-                            ffmpeg_bin(),
-                            "-y",
-                            "-i",
-                            native,
-                            "-codec:a",
-                            "aac",
-                            "-b:a",
-                            "128k",
-                            m4a_path,
-                        ],
-                        check=True,
-                        capture_output=True,
-                    )
-                    os.remove(native)
-                    return m4a_path
-                except subprocess.CalledProcessError:
-                    return native
-            return native
-
-        if phase_cb:
-            phase_cb("تم تنزيل الصوت (100%). جاري قصّ وتحويل المقطع إلى MP3...")
-        mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
-        subprocess.run(
-            [
-                ffmpeg_bin(),
-                "-y",
-                "-ss",
-                str(start),
-                "-t",
-                str(end - start),
-                "-i",
-                native,
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                f"{quality_kbps}k",
-                mp3_path,
-            ],
-            check=True,
-            capture_output=True,
-        )
-        os.remove(native)
-        return mp3_path
-
-    return await asyncio.to_thread(_run)
+    if os.path.isdir(FFMPEG):
+        return os.path.join(FFMPEG, "ffmpeg")
+    return FFMPEG
 
 
 def cleanup(uid: str) -> None:
@@ -332,94 +179,334 @@ def cleanup(uid: str) -> None:
         try:
             os.remove(path)
         except OSError:
-            logger.warning("تعذر حذف الملف المؤقت: %s", path)
+            pass
 
 
-def build_quick_keyboard() -> InlineKeyboardMarkup:
-    keyboard = [
+def make_progress_hook(progress_q: "queue.Queue"):
+    """خطاف تقدم التنزيل: ينقل نسبة التقدم من خيط yt-dlp إلى قائمة آمنة
+    تقرأها حلقة asyncio لتحديث رسالة التقدم في تيليجرام."""
+    def hook(data: dict):
+        try:
+            if data.get("status") == "downloading":
+                done = data.get("downloaded_bytes") or 0
+                total = (
+                    data.get("total_bytes")
+                    or data.get("total_bytes_estimate")
+                    or 0
+                )
+                progress_q.put(("download", done, total))
+        except Exception:
+            pass
+    return hook
+
+
+# ---------------------------------------------------------------------------
+# جلب معلومات الفيديو مع تناوب العملاء
+# ---------------------------------------------------------------------------
+async def get_video_info(url: str) -> dict:
+    def _fetch() -> dict:
+        last_error: Exception | None = None
+        # العملاء الذين يعملون موثوقين: android_vr ثم ios ثم tv.
+        # (قائمة كاملة في extract_info مع download=True قد تعلق؛ هنا download=False)
+        client_sets = [
+            ["android_vr"],
+            ["ios"],
+            ["tv"],
+        ]
+        for clients in client_sets:
+            opts = dict(YDL_COMMON)
+            opts["extractor_args"] = {
+                "youtube": {"player_client": clients}
+            }
+            try:
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "فشل جلب المعلومات بالعملاء %s: %s",
+                    clients, underlying_error(exc),
+                )
+        raise last_error or RuntimeError("فشل جلب معلومات الفيديو")
+
+    return await asyncio.to_thread(_fetch)
+
+
+# ---------------------------------------------------------------------------
+# تنزيل + قصّ الصوت بدون إعادة ترميز (قصّ لحظي سريع)
+# ---------------------------------------------------------------------------
+async def download_and_cut(
+    url: str,
+    uid: str,
+    start: int | None,
+    end: int | None,
+    quality: str = DEFAULT_QUALITY,
+    hook: "queue.Queue | None" = None,
+) -> str | None:
+    """تنزيل أفضل صوت ثم إنتاجه بالجودة المطلوبة.
+
+    - جودة عالية: قصّ بنسخ مباشر -c:a copy (بدون إعادة ترميز، فوري).
+    - جودة أقل: تفضيل صيغة أقل معدل بتاً للتنزيل، وإن لزم إعادة ترميز AAC
+      بمعدل البت المطلوب لضمان الحجم الصغير.
+    """
+    bitrate = QUALITY_OPTIONS[quality]["bitrate"]
+    is_segment = start is not None and end is not None
+
+    def _run() -> str | None:
+        outtmpl = os.path.join(TEMP_DIR, f"{uid}.%(ext)s")
+
+        # للقصّ: ننزّل الجزء المطلوب فقط عبر download_ranges (بدل الصوت كاملاً).
+        # هذا يقلص حجم التنزيل عشرات المرات (مثلاً 159KB بدل 21MB) فينجز بسرعة
+        # حتى على شبكات بطيئة. نفضّل m4a لأن تدفقه متسلسل فينزّل بسرعة موثوقة.
+        last_error: Exception | None = None
+        for attempt in range(4):
+            opts = dict(YDL_COMMON)
+
+            # نثبّت android_vr للتنزيل: قائمة العملاء الكاملة مع download=True قد تعلق
+            opts["extractor_args"] = {"youtube": {"player_client": ["android_vr"]}}
+
+            if bitrate:
+                fmt = (
+                    f"bestaudio[abr<={bitrate}][ext=m4a]/"
+                    f"bestaudio[abr<={bitrate}]/"
+                    f"bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+                )
+            else:
+                fmt = "bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio/best"
+            opts.update({"format": fmt, "outtmpl": outtmpl})
+
+            # للمقاطع فقط: ننزّل الجزء المطلوب دون إعادة ترميز
+            if is_segment:
+                opts["download_ranges"] = lambda info, ydl: [
+                    {"start_time": start, "end_time": end}
+                ]
+            if hook is not None:
+                opts["progress_hooks"] = [make_progress_hook(hook)]
+
+            try:
+                for leftover in glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")):
+                    try:
+                        os.remove(leftover)
+                    except OSError:
+                        pass
+                with yt_dlp.YoutubeDL(opts) as ydl:
+                    ydl.extract_info(url, download=True)
+                last_error = None
+                break
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "فشل التنزيل (محاولة %d): %s",
+                    attempt + 1, underlying_error(exc),
+                )
+                time.sleep(3 * (attempt + 1))
+
+        # الملف الذي أنزله yt-dlp
+        matches = sorted(glob.glob(os.path.join(TEMP_DIR, f"{uid}.*")))
+        native = next((p for p in matches if not p.endswith(".part")), None)
+        if native is None and last_error:
+            raise last_error
+        return native
+
+    native = await asyncio.to_thread(_run)
+    if not native:
+        return None
+
+    reencode = bool(bitrate) and _needs_reencode(native, bitrate)
+
+    # إن كان المطلوب الصوت كاملاً: نعيد الملف كما هو إن كان m4a،
+    # وإن كان webm نحوّله إلى m4a دون إعادة ترميز إن أمكن (نسخ الحاوية).
+    if start is None and end is None and not reencode:
+        if native.lower().endswith(".m4a"):
+            return native
+        if native.lower().endswith(".webm") or native.lower().endswith(".opus"):
+            out_path = os.path.join(TEMP_DIR, f"{uid}.m4a")
+            try:
+                subprocess.run(
+                    [
+                        ffmpeg_bin(),
+                        "-y",
+                        "-i",
+                        native,
+                        "-vn",
+                        "-c:a",
+                        "copy",
+                        out_path,
+                    ],
+                    check=True,
+                    capture_output=True,
+                )
+                os.remove(native)
+                return out_path
+            except subprocess.CalledProcessError:
+                return native
+
+    # عند الحاجة لجودة أدق من الصيغة المتاحة: إعادة ترميز بمعدل البت المطلوب
+    if reencode:
+        # مع download_ranges يبدأ الملف الجزئي من 0، فالتشفير يكون من البداية
+        encode_from = 0 if is_segment else start
+        return _encode_aac(native, uid, bitrate, encode_from, end)
+
+    # قصّ مقطع: نسخ مباشر -c:a copy (فوري، بلا إعادة ترميز)
+    # (مع download_ranges يبدأ الملف الجزئي من 0، فالقصّ يكون من البداية)
+    out_path = os.path.join(TEMP_DIR, f"{uid}-cut.m4a")
+    duration = end - start
+    seek_at = 0 if is_segment else start
+    subprocess.run(
         [
-            InlineKeyboardButton("جودة عالية (192)", callback_data="q192"),
-            InlineKeyboardButton("متوسطة (128)", callback_data="q128"),
-            InlineKeyboardButton("منخفضة (96)", callback_data="q96"),
-            InlineKeyboardButton("الأقل (64)", callback_data="q64"),
+            ffmpeg_bin(),
+            "-y",
+            "-ss",
+            str(seek_at),
+            "-t",
+            str(duration),
+            "-i",
+            native,
+            "-vn",
+            "-c:a",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            out_path,
         ],
-        [
-            InlineKeyboardButton("أول 30 ثانية", callback_data="first30"),
-            InlineKeyboardButton("أول دقيقة", callback_data="first60"),
-        ],
-        [
-            InlineKeyboardButton("الصوت الكامل", callback_data="full"),
-            InlineKeyboardButton("إلغاء", callback_data="cancel"),
-        ],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+        check=True,
+        capture_output=True,
+    )
+    os.remove(native)
+    return out_path
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    if ALLOWED_USER_IDS and update.effective_user.id not in ALLOWED_USER_IDS:
-        await update.message.reply_text("عذراً، هذا البوت غير متاح لك.")
-        return ConversationHandler.END
-    context.user_data.clear()
-    await update.message.reply_text(
+def _needs_reencode(path: str, bitrate: int) -> bool:
+    """يرجع True إن كانت الصيغة أعلى من معدل البت المطلوب (فتحتاج ترميزاً أدق)."""
+    try:
+        probe = subprocess.run(
+            [
+                "ffprobe",
+                "-v",
+                "error",
+                "-show_entries",
+                "format=bit_rate:stream=codec_name,bit_rate",
+                "-of",
+                "json",
+                path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        data = json.loads(probe.stdout)
+        codec = None
+        stream_bitrate = 0
+        for stream in data.get("streams", []):
+            if stream.get("codec_type") == "audio":
+                codec = stream.get("codec_name")
+                stream_bitrate = int(stream.get("bit_rate") or 0)
+                break
+        if codec and codec not in ("aac", "mp4a", "opus"):
+            return True
+        effective = stream_bitrate or int(data.get("format", {}).get("bit_rate") or 0)
+        return effective > bitrate * 1000 * 1.15
+    except Exception:
+        return True
+
+
+def _encode_aac(
+    native: str,
+    uid: str,
+    bitrate: int,
+    start: int | None,
+    end: int | None,
+) -> str:
+    """إعادة ترميز AAC بمعدل بت محدد (لجودة أقل)."""
+    out_path = os.path.join(TEMP_DIR, f"{uid}-q.m4a")
+    cmd = [ffmpeg_bin(), "-y"]
+    if start is not None and end is not None:
+        cmd += ["-ss", str(start), "-t", str(end - start)]
+    cmd += ["-i", native, "-vn", "-c:a", "aac", "-b:a", f"{bitrate}k", out_path]
+    subprocess.run(cmd, check=True, capture_output=True)
+    os.remove(native)
+    return out_path
+
+
+# ---------------------------------------------------------------------------
+# أزرار الاختيار السريع
+# ---------------------------------------------------------------------------
+def quick_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="أول 30 ثانية", callback_data="first30"),
+                InlineKeyboardButton(text="أول دقيقة", callback_data="first60"),
+                InlineKeyboardButton(text="الصوت كامل", callback_data="full"),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="جودة: عالية", callback_data="quality:high"
+                ),
+                InlineKeyboardButton(
+                    text="جودة: متوسطة 128k", callback_data="quality:medium"
+                ),
+                InlineKeyboardButton(
+                    text="جودة: منخفضة 64k", callback_data="quality:low"
+                ),
+            ],
+            [
+                InlineKeyboardButton(text="إلغاء", callback_data="cancel"),
+            ],
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# معالجات الأوامر
+# ---------------------------------------------------------------------------
+@router.message(CommandStart())
+async def cmd_start(message: Message, state: FSMContext) -> None:
+    if ALLOWED_USER_IDS and message.from_user.id not in ALLOWED_USER_IDS:
+        await message.answer("عذراً، هذا البوت غير متاح لك.")
+        return
+    await state.clear()
+    await message.answer(
         "مرحباً بك في بوت قصّ الصوتيات من يوتيوب.\n\n"
-        "أرسل لي رابط فيديو يوتيوب لأرسل لك صوته بالشكل الذي تريده:\n"
+        "أرسل رابط فيديو يوتيوب لأرسل لك صوته بالشكل الذي تريده:\n"
         "- قصّ جزء محدد بالتوقيت\n"
-        "- أو الصوت كاملاً\n"
-        "أو أرسل /help لمعرفة كل الخيارات."
+        "- أو الصوت كاملاً"
     )
-    return WAITING_FOR_URL
+    await state.set_state(CutState.waiting_for_url)
 
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text(
-        "كيفية الاستخدام:\n\n"
-        "1. أرسل رابط فيديو يوتيوب.\n"
-        "2. بعد ظهور معلومات الفيديو، أرسل التوقيت بهذا الشكل:\n"
-        "   MM:SS - MM:SS   (مثال: 01:30 - 04:15)\n"
-        "   HH:MM:SS - HH:MM:SS   (مثال: 00:01:30 - 00:04:15)\n"
-        "3. أو استخدم الأزرار السريعة (أول 30 ثانية / أول دقيقة / الصوت الكامل).\n"
-        "4. أو اكتب كلمة: كامل  لإرسال صوت الفيديو كاملاً.\n\n"
-        "الأوامر:\n"
-        "/start - بدء محادثة جديدة\n"
-        "/cancel - إلغاء العملية الحالية"
-    )
+@router.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext) -> None:
+    await state.clear()
+    await message.answer("تم إلغاء العملية. أرسل /start للبدء من جديد.")
 
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await update.message.reply_text("تم إلغاء العملية. أرسل /start للبدء من جديد.")
-    context.user_data.clear()
-    return ConversationHandler.END
-
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
+@router.message(CutState.waiting_for_url, F.text)
+async def handle_url(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
     match = YOUTUBE_URL_RE.search(text)
     if not match:
-        await update.message.reply_text(
-            "الرابط الذي أرسلته ليس رابط يوتيوب صحيح.\n"
-            "أرسل رابطاً من YouTube أو youtu.be من فضلك."
-        )
-        return WAITING_FOR_URL
+        await message.answer("هذا ليس رابط يوتيوب صحيح. حاول مجدداً.")
+        return
 
     video_id = match.group(1)
-    context.user_data["url"] = f"https://www.youtube.com/watch?v={video_id}"
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    await state.update_data(url=url, quality=DEFAULT_QUALITY)
 
-    status = await update.message.reply_text("جاري جلب معلومات الفيديو...")
+    status = await message.answer("جاري جلب معلومات الفيديو...")
     try:
-        info = await get_video_info(context.user_data["url"])
+        info = await get_video_info(url)
     except Exception as exc:
         logger.exception("فشل جلب معلومات الفيديو")
-        await safe_edit(status, arabic_error(exc))
-        return WAITING_FOR_URL
+        await status.edit_text(arabic_error(exc))
+        return
 
     title = (info.get("title") or "مقطع صوتي").strip()
     duration = info.get("duration") or 0
     channel = (info.get("channel") or "").strip()
+    await state.update_data(title=title, duration=duration)
 
-    context.user_data["title"] = title
-    context.user_data["duration"] = duration
-
-    text = (
+    await status.edit_text(
         f"تم التعرف على الفيديو:\n\n"
         f"العنوان: {title}\n"
         f"القناة: {channel or 'غير معروفة'}\n"
@@ -427,425 +514,276 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         f"أرسل توقيت القص بالشكل:\n"
         f"MM:SS - MM:SS   (مثال: 01:30 - 04:15)\n"
         f"HH:MM:SS - HH:MM:SS   (مثال: 00:01:30 - 00:04:15)\n"
-        f"أو استخدم الأزرار أدناه، أو اكتب: كامل"
+        f"أو استخدم الأزرار أدناه، أو اكتب: كامل\n\n"
+        f"الجودة الحالية: {QUALITY_OPTIONS[DEFAULT_QUALITY]['label']}\n"
+        f"اختر جودة مختلفة بزر الجودة، أو اكتب: عالي / متوسط / منخفض",
+        reply_markup=quick_keyboard(),
     )
-    await status.edit_text(text, reply_markup=build_quick_keyboard())
-    return WAITING_FOR_TIME
+    await state.set_state(CutState.waiting_for_time)
 
 
-async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    text = update.message.text.strip()
+@router.callback_query(F.data == "cancel")
+async def cb_cancel(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    try:
+        await callback.message.edit_text("تم إلغاء العملية. أرسل /start للبدء من جديد.")
+    except Exception:
+        pass
 
+
+async def safe_answer(callback: CallbackQuery, text: str | None = None) -> None:
+    try:
+        await callback.answer(text)
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data.startswith("quality:"))
+async def cb_quality(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    quality = callback.data.split(":", 1)[1]
+    if quality not in QUALITY_OPTIONS:
+        return
+    await state.update_data(quality=quality)
+    label = QUALITY_OPTIONS[quality]["label"]
+    await callback.message.answer(f"تم اختيار الجودة: {label}.")
+
+
+@router.callback_query(F.data.in_({"first30", "first60", "full"}))
+async def cb_quick(callback: CallbackQuery, state: FSMContext) -> None:
+    await safe_answer(callback)
+    data = await state.get_data()
+    if data.get("url") is None:
+        await state.clear()
+        await callback.message.answer("أرسل /start للبدء من جديد.")
+        return
+
+    if callback.data == "full":
+        await state.update_data(start=None, end=None)
+    elif callback.data == "first30":
+        await state.update_data(start=0, end=30)
+    elif callback.data == "first60":
+        await state.update_data(start=0, end=60)
+
+    try:
+        await callback.message.edit_text("جاري المعالجة...")
+    except Exception:
+        pass
+    await process_and_send(callback.message, state)
+
+
+@router.message(CutState.waiting_for_time, F.text)
+async def handle_time(message: Message, state: FSMContext) -> None:
+    text = message.text.strip()
+
+    # إن أرسل رابطاً جديداً: نعيد ضبط الجلسة
     if YOUTUBE_URL_RE.search(text):
-        return await handle_url(update, context)
+        await handle_url(message, state)
+        return
+
+    quality_words = {
+        "عالي": "high", "عالية": "high", "عالي جداً": "high",
+        "متوسط": "medium", "متوسطة": "medium",
+        "منخفض": "low", "منخفضة": "low", "64": "low", "128": "medium",
+    }
+    clean = text.strip().replace(" ", "")
+    if clean in quality_words or clean.lower() in {"high", "medium", "low"}:
+        quality = quality_words.get(clean, quality_words.get(clean.lower(), clean.lower()))
+        if quality not in QUALITY_OPTIONS:
+            await message.answer("الجودة غير معروفة. الخيارات: عالي / متوسط / منخفض")
+            return
+        await state.update_data(quality=quality)
+        await message.answer(
+            f"تم اختيار الجودة: {QUALITY_OPTIONS[quality]['label']}. أرسل التوقيت الآن."
+        )
+        return
 
     if text.replace(" ", "").lower() in ("كامل", "كل", "full", "all"):
-        context.user_data.pop("start", None)
-        context.user_data.pop("end", None)
-        context.user_data["full"] = True
-        await start_processing(update, context)
-        return ConversationHandler.END
+        await state.update_data(start=None, end=None)
+        await process_and_send(message, state)
+        return
 
     tokens = [token for token in re.split(r"[\s\-–—,]+", text) if token]
     if len(tokens) != 2:
-        await update.message.reply_text(
-            "لم أفهم التوقيت. أرسله بهذا الشكل:\nمثال: 01:30 - 04:15"
-        )
-        return WAITING_FOR_TIME
+        await message.answer("لم أفهم التوقيت. أرسله بهذا الشكل:\nمثال: 01:30 - 04:15")
+        return
 
     start, end = parse_time(tokens[0]), parse_time(tokens[1])
     if start is None or end is None:
-        await update.message.reply_text(
-            "صيغة الأوقات غير صحيحة. استخدم MM:SS أو HH:MM:SS\nمثال: 01:30 - 04:15"
-        )
-        return WAITING_FOR_TIME
-
+        await message.answer("صيغة الأوقات غير صحيحة. استخدم MM:SS أو HH:MM:SS")
+        return
     if end <= start:
-        await update.message.reply_text(
-            "وقت النهاية يجب أن يكون أكبر من وقت البداية.\nأعد الإرسال بالشكل الصحيح."
-        )
-        return WAITING_FOR_TIME
-
-    context.user_data["start"] = start
-    context.user_data["end"] = end
-    context.user_data.pop("full", None)
-
-    await start_processing(update, context)
-    return ConversationHandler.END
-
-
-async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    data = query.data
-
-    if data == "cancel":
-        await query.edit_message_text("تم إلغاء العملية. أرسل /start للبدء من جديد.")
-        context.user_data.clear()
-        return ConversationHandler.END
-
-    if data == "full":
-        context.user_data.pop("start", None)
-        context.user_data.pop("end", None)
-        context.user_data["full"] = True
-    elif data == "first30":
-        context.user_data.update(start=0, end=30, full=False)
-    elif data == "first60":
-        context.user_data.update(start=0, end=60, full=False)
-    elif data in ("q192", "q128", "q96", "q64"):
-        quality = data[1:]
-        context.user_data["quality"] = quality
-        await query.edit_message_text(
-            f"تم اختيار الجودة: {quality}kbps\n\n"
-            "الآن أرسل التوقيت (مثال: 01:30 - 04:15) أو استخدم الأزرار.",
-            reply_markup=build_quick_keyboard(),
-        )
-        return WAITING_FOR_TIME
-
-    await start_processing(update, context)
-    return ConversationHandler.END
-
-
-async def start_processing(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if update.callback_query:
-        status = await update.callback_query.message.reply_text(
-            "جاري معالجة الصوت... يرجى الانتظار."
-        )
-    else:
-        status = await update.message.reply_text(
-            "جاري معالجة الصوت... يرجى الانتظار."
-        )
-    try:
-        await process(context, status)
-    finally:
-        context.user_data.clear()
-
-
-async def process(context: ContextTypes.DEFAULT_TYPE, status) -> None:
-    url = context.user_data["url"]
-    full = context.user_data.pop("full", False)
-    start = context.user_data.get("start")
-    end = context.user_data.get("end")
-
-    try:
-        info = await get_video_info(url)
-    except Exception as exc:
-        logger.exception("فشل جلب معلومات الفيديو")
-        await safe_edit(status, arabic_error(exc))
+        await message.answer("وقت النهاية يجب أن يكون أكبر من وقت البداية.")
         return
 
-    duration = info.get("duration") or 0
-    title = (info.get("title") or "مقطع صوتي").strip()
-    quality_kbps = int(context.user_data.get("quality", AUDIO_QUALITY))
+    data = await state.get_data()
+    duration = data.get("duration") or 0
+    if duration and end > duration:
+        await message.answer(
+            f"وقت النهاية ({format_time(end)}) يتجاوز مدة الفيديو ({format_time(duration)})."
+        )
+        return
+    if end - start > MAX_SEGMENT_SECONDS:
+        await message.answer(
+            f"المقطع المطلوب أطول من المسموح (الحد الأقصى {MAX_SEGMENT_SECONDS // 3600} ساعة)."
+        )
+        return
 
-    if not full:
-        if duration and end > duration:
-            await safe_edit(
-                status,
-                f"وقت النهاية ({format_time(end)}) يتجاوز مدة الفيديو ({format_time(duration)}).\n"
-                "أرسل /start وجرّب توقيتاً صحيحاً.",
-            )
-            return
-        if end - start > MAX_SEGMENT_SECONDS:
-            await safe_edit(
-                status,
-                f"المقطع المطلوب أطول من المسموح (الحد الأقصى {MAX_SEGMENT_SECONDS // 3600} ساعة "
-                f"و{(MAX_SEGMENT_SECONDS % 3600) // 60} دقيقة).\n"
-                "أرسل /start وجرّب مقطعاً أقصر.",
-            )
-            return
-        segment_seconds = end - start
-    else:
-        segment_seconds = duration
+    await state.update_data(start=start, end=end)
+    await process_and_send(message, state)
 
-    if not full:
-        estimated_size = estimate_mp3_size(segment_seconds, quality_kbps)
-        if estimated_size > MAX_UPLOAD_BYTES:
-            estimated_mb = estimated_size / (1024 * 1024)
-            await safe_edit(
-                status,
-                f"المدة المطلوبة ({format_time(segment_seconds)}) ستنتج ملفاً بحجم تقريبي "
-                f"{estimated_mb:.0f}MB (بجودة {quality_kbps}kbps)، وهو أكبر من حد إرسال تيليغرام (50MB).\n"
-                "جرّب جودة أقل، أو مدة أقصر، أو قسم الفيديو إلى عدة مقاطع.",
-            )
-            return
+
+# ---------------------------------------------------------------------------
+# المعالجة والإرسال
+# ---------------------------------------------------------------------------
+async def process_and_send(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    url = data.get("url")
+    if not url:
+        await state.clear()
+        await message.answer("أرسل /start للبدء من جديد.")
+        return
+
+    title = (data.get("title") or "مقطع صوتي").strip()
+    start = data.get("start")
+    end = data.get("end")
+    quality = data.get("quality", DEFAULT_QUALITY)
+    if quality not in QUALITY_OPTIONS:
+        quality = DEFAULT_QUALITY
+
+    status = await message.answer(
+        f"جاري تنزيل الصوت وقصّه (جودة: {QUALITY_OPTIONS[quality]['label']})..."
+        if start is not None
+        else f"جاري تنزيل الصوت كاملاً (جودة: {QUALITY_OPTIONS[quality]['label']})..."
+    )
 
     uid = uuid.uuid4().hex
-    loop = asyncio.get_running_loop()
     try:
-        if full:
-            segment_label = "كامل"
-            await safe_edit(
-                status, f"العنوان: {title}\nجاري تنزيل الصوت كاملاً..."
-            )
-        else:
-            segment_label = f"{format_time(start)} - {format_time(end)}"
-            await safe_edit(
-                status,
-                f"العنوان: {title}\nجاري تنزيل الصوت وقصّه ({segment_label})...",
-            )
-
-        progress_hook = build_progress_hook(status, loop)
-        phase_cb = build_phase_editor(status, loop)
-        final_path = await download_audio(
-            url,
-            uid,
-            None if full else start,
-            None if full else end,
-            progress_hook=progress_hook,
-            quality_kbps=quality_kbps,
-            phase_cb=phase_cb,
+        progress_q: queue.Queue = queue.Queue()
+        process_task = asyncio.create_task(
+            download_and_cut(url, uid, start, end, quality, progress_q)
         )
-        if not final_path:
-            raise RuntimeError("لم يتم إنشاء ملف الصوت النهائي.")
 
-        file_size = os.path.getsize(final_path)
-        if file_size > MAX_UPLOAD_BYTES:
-            await safe_edit(
-                status,
-                "حجم الملف الناتج يتجاوز الحد المسموح للإرسال في تيليغرام (50MB) "
-                "حتى بعد ضغط الجودة. جرّب مقطعاً أقصر.",
+        async def progress_loop() -> None:
+            last_reported = -1
+            while not process_task.done():
+                try:
+                    kind, done, total = progress_q.get_nowait()
+                    if kind == "download" and total:
+                        pct = int(done * 100 // total)
+                        if pct // 10 > last_reported // 10:
+                            last_reported = pct
+                            try:
+                                await status.edit_text(
+                                    f"جاري التنزيل... {pct}%"
+                                )
+                            except Exception:
+                                pass
+                except queue.Empty:
+                    pass
+                await asyncio.sleep(0.3)
+
+        progress_task = asyncio.create_task(progress_loop())
+        try:
+            path = await asyncio.wait_for(process_task, timeout=PROCESS_TIMEOUT)
+        except asyncio.TimeoutError:
+            process_task.cancel()
+            await status.edit_text(
+                "انتهت مهلة المعالجة (الشبكة بطيئة أو يوتيوب يعرقل التنزيل).\n"
+                "جرّب مقطعاً أقصر أو جودة أقل."
+            )
+            return
+        finally:
+            progress_task.cancel()
+        if not path:
+            raise RuntimeError("لم يتم إنشاء ملف الصوت.")
+
+        if os.path.getsize(path) > MAX_UPLOAD_BYTES:
+            await status.edit_text(
+                "حجم الملف الناتج يتجاوز حد الإرسال في تيليغرام (50MB).\n"
+                "جرّب مقطعاً أقصر."
             )
             return
 
-        await safe_edit(status, "جاري إرسال الملف...")
+        await status.edit_text("جاري إرسال الملف...")
+        if start is not None:
+            segment_label = f"{format_time(start)} - {format_time(end)}"
+        else:
+            segment_label = "كامل"
         caption = f"{title}\nالتوقيت: {segment_label}"
-        last_error: Exception | None = None
+
+        # إرسال كـ Audio وليس Document
         for attempt in range(3):
             try:
-                with open(final_path, "rb") as audio_file:
-                    await status.reply_audio(
-                        audio=audio_file,
+                with open(path, "rb") as audio_file:
+                    await message.answer_audio(
+                        audio=BufferedInputFile(audio_file.read(), filename=f"{title[:40]}_{segment_label}.m4a"),
                         title=title,
                         caption=caption,
                         performer="YouTube",
                     )
-                last_error = None
                 break
             except Exception as exc:
-                last_error = exc
-                logger.warning("فشل إرسال الملف (محاولة %d): %s", attempt + 1, exc)
-                await asyncio.sleep(5 * (attempt + 1))
-        if last_error is not None:
-            raise last_error
+                logger.warning("فشل الإرسال (محاولة %d): %s", attempt + 1, exc)
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+                else:
+                    raise
+
         try:
             await status.delete()
         except Exception:
             pass
     except Exception as exc:
         logger.exception("فشل معالجة المقطع")
-        await safe_edit(status, arabic_error(exc))
+        await status.edit_text(arabic_error(exc))
     finally:
         cleanup(uid)
+        await state.clear()
 
 
-async def prompt_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.message.reply_text("أرسل /start لبدء استخدام البوت.")
+# ---------------------------------------------------------------------------
+# خادم ويب خفيف /ping لمنع نوم الحاوية
+# ---------------------------------------------------------------------------
+async def ping_server() -> None:
+    from aiohttp import web
+
+    async def ping(request):
+        return web.Response(text="ok")
+
+    app = web.Application()
+    app.router.add_get("/ping", ping)
+    app.router.add_get("/healthz", ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    logger.info("خادم /ping يعمل على المنفذ %s", PORT)
 
 
-async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    logger.error("خطأ غير متوقع أثناء معالجة التحديث:", exc_info=context.error)
-
-
-def build_application() -> Application:
-    builder = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .read_timeout(300)
-        .write_timeout(300)
-        .media_write_timeout(600)
-        .connect_timeout(20)
-    )
-    if BOT_API_URL != "https://api.telegram.org/bot":
-        builder = builder.base_url(BOT_API_URL).base_file_url(BOT_API_FILE_URL)
-    application = builder.build()
-
-    conversation_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            WAITING_FOR_URL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url)
-            ],
-            WAITING_FOR_TIME: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time),
-                CallbackQueryHandler(handle_callback),
-            ],
-        },
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CommandHandler("start", start),
-        ],
-    )
-
-    application.add_handler(conversation_handler)
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, prompt_start))
-    application.add_error_handler(error_handler)
-    return application
-
-
-def run_webhook_mode(application: Application | None) -> None:
-    import uvicorn
-    from fastapi import FastAPI, Request
-    from fastapi.responses import JSONResponse, Response
-
-    web_app = FastAPI()
-
-    @web_app.on_event("startup")
-    async def _startup():
-        if application is None:
-            logger.error("لا يوجد تطبيق بوت لتفعيل webhook.")
-            return
-        await application.initialize()
-        await application.start()
-        webhook_secret = WEBHOOK_SECRET or None
-        await application.bot.set_webhook(
-            url=WEBHOOK_URL + WEBHOOK_PATH,
-            secret_token=webhook_secret,
-            drop_pending_updates=True,
-        )
-        logger.info("تم تفعيل الـ webhook على %s%s", WEBHOOK_URL, WEBHOOK_PATH)
-
-    @web_app.on_event("shutdown")
-    async def _shutdown():
-        if application is not None:
-            await application.stop()
-            await application.shutdown()
-
-    @web_app.get("/healthz")
-    async def _healthz():
-        return JSONResponse({"status": "ok"})
-
-    @web_app.get("/diag")
-    async def _diag():
-        import urllib.request
-
-        result: dict = {}
-
-        try:
-            with urllib.request.urlopen(
-                "https://api.ipify.org", timeout=15
-            ) as resp:
-                result["outbound_ip"] = resp.read().decode().strip()
-        except Exception as exc:
-            result["outbound_ip"] = f"error: {exc}"
-
-        try:
-            with urllib.request.urlopen(
-                "https://ipwho.is/" + result.get("outbound_ip", ""), timeout=15
-            ) as resp:
-                ipinfo = json.loads(resp.read().decode())
-                result["asn"] = ipinfo.get("connection", {}).get("asn")
-                result["org"] = ipinfo.get("connection", {}).get("org")
-                result["isp"] = ipinfo.get("connection", {}).get("isp")
-        except Exception as exc:
-            result["ipinfo_error"] = str(exc)
-
-        result["yt_dlp_version"] = yt_dlp.version.__version__
-        result["cookies_loaded"] = bool(COOKIES_FILE)
-
-        def _test_yt(url: str, player_client: str, use_cookies: bool) -> str:
-            options = {
-                "quiet": True,
-                "noplaylist": True,
-                "skip_download": True,
-                "js_runtimes": {"node": {}},
-                "extractor_args": {
-                    "youtube": {"player_client": [player_client]}
-                },
-            }
-            if use_cookies and COOKIES_FILE:
-                options["cookiefile"] = COOKIES_FILE
-            try:
-                with yt_dlp.YoutubeDL(options) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                return f"OK formats={len(info.get('formats', []))}"
-            except Exception as exc:
-                return f"FAIL: {underlying_error(exc)[:180]}"
-
-        url = "https://www.youtube.com/watch?v=rupFLbOkioQ"
-        result["test_android_vr_no_cookies"] = _test_yt(
-            url, "android_vr", False
-        )
-        result["test_android_vr_with_cookies"] = _test_yt(
-            url, "android_vr", True
-        )
-        return JSONResponse(result)
-
-    @web_app.post(WEBHOOK_PATH)
-    async def _webhook(request: Request):
-        if application is None:
-            return Response(status_code=503)
-        if WEBHOOK_SECRET and (
-            request.headers.get("X-Telegram-Bot-Api-Secret-Token") != WEBHOOK_SECRET
-        ):
-            return Response(status_code=401)
-        data = json.loads(await request.body())
-        update = Update.de_json(data, application.bot)
-        await application.update_queue.put(update)
-        return Response(status_code=200)
-
-    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
-
-
-def run_polling_with_health(application: Application | None) -> None:
-    import uvicorn
-    from fastapi import FastAPI
-    from fastapi.responses import JSONResponse
-
-    web_app = FastAPI()
-
-    async def _start_bot() -> None:
-        if application is None:
-            logger.error("لا يوجد تطبيق بوت لبدء polling.")
-            return
-        try:
-            await application.initialize()
-            await application.start()
-            await application.updater.start_polling(
-                drop_pending_updates=True,
-                read_timeout=300,
-                write_timeout=300,
-                connect_timeout=20,
-            )
-            logger.info("تم تشغيل البوت بوضع polling على منفذ %s", PORT)
-        except Exception:
-            logger.exception("فشل تشغيل البوت بوضع polling")
-
-    @web_app.on_event("startup")
-    async def _startup():
-        asyncio.create_task(_start_bot())
-
-    @web_app.on_event("shutdown")
-    async def _shutdown():
-        if application is not None:
-            await application.stop()
-            await application.shutdown()
-
-    @web_app.get("/healthz")
-    async def _healthz():
-        return JSONResponse({"status": "ok"})
-
-    uvicorn.run(web_app, host="0.0.0.0", port=PORT, log_level="info")
-
-
-def main() -> None:
+# ---------------------------------------------------------------------------
+# نقطة الدخول
+# ---------------------------------------------------------------------------
+async def main() -> None:
+    global bot
     if not BOT_TOKEN:
-        logger.error(
-            "لم يتم تحديد BOT_TOKEN. اضبط متغير البيئة BOT_TOKEN أولاً ثم أعد التشغيل."
-        )
+        logger.error("لا يوجد BOT_TOKEN. اضبط متغير البيئة.")
+        sys.exit(1)
 
-    try:
-        application = build_application()
-    except Exception as exc:
-        logger.error("فشل بناء التطبيق: %s", exc)
-        application = None
+    bot = Bot(token=BOT_TOKEN)
+    dp = Dispatcher()
+    dp.include_router(router)
 
-    if WEBHOOK_URL:
-        run_webhook_mode(application)
-    else:
-        run_polling_with_health(application)
+    # خادم /ping بالتوازي مع البوت
+    asyncio.create_task(ping_server())
+
+    # بدء الاستطلاع (polling) — يبقي البوت حياً دائماً
+    logger.info("بدء تشغيل البوت بوضع polling...")
+    await dp.start_polling(bot, allowed_updates=["message", "callback_query"])
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("تم إيقاف البوت.")
