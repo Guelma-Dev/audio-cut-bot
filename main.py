@@ -279,29 +279,79 @@ async def download_audio(
             return native
 
         if phase_cb:
-            phase_cb("تم تنزيل الصوت (100%). جاري قصّ وتحويل المقطع إلى MP3...")
-        mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
-        subprocess.run(
-            [
-                ffmpeg_bin(),
-                "-y",
-                "-ss",
-                str(start),
-                "-t",
-                str(end - start),
-                "-i",
-                native,
-                "-codec:a",
-                "libmp3lame",
-                "-b:a",
-                f"{quality_kbps}k",
-                mp3_path,
-            ],
-            check=True,
-            capture_output=True,
-        )
+            phase_cb("تم تنزيل الصوت (100%). جاري قصّ المقطع بنسخ مباشر سريع (بدون إعادة ترميز)...")
+        ext = os.path.splitext(native)[1].lower()
+        if ext not in (".m4a", ".webm"):
+            ext = ".m4a"
+        cut_path = os.path.join(TEMP_DIR, f"{uid}.cut{ext}")
+        copy_cmd = [
+            ffmpeg_bin(),
+            "-y",
+            "-ss",
+            str(start),
+            "-t",
+            str(end - start),
+            "-i",
+            native,
+            "-c:a",
+            "copy",
+            "-map_metadata",
+            "-1",
+        ]
+        if ext == ".m4a":
+            copy_cmd += ["-movflags", "+faststart"]
+        copy_cmd.append(cut_path)
+        try:
+            subprocess.run(copy_cmd, check=True, capture_output=True)
+        except subprocess.CalledProcessError:
+            if phase_cb:
+                phase_cb("تعذّر القصّ بالنسخ المباشر، جاري التحويل إلى M4A...")
+            cut_path = os.path.join(TEMP_DIR, f"{uid}.cut.m4a")
+            subprocess.run(
+                [
+                    ffmpeg_bin(),
+                    "-y",
+                    "-ss",
+                    str(start),
+                    "-t",
+                    str(end - start),
+                    "-i",
+                    native,
+                    "-codec:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    cut_path,
+                ],
+                check=True,
+                capture_output=True,
+            )
+
+        final = cut_path
+        if os.path.getsize(final) > MAX_UPLOAD_BYTES:
+            if phase_cb:
+                phase_cb("حجم المقطع كبير، جاري ضغطه إلى MP3 بالجودة المختارة...")
+            mp3_path = os.path.join(TEMP_DIR, f"{uid}.mp3")
+            subprocess.run(
+                [
+                    ffmpeg_bin(),
+                    "-y",
+                    "-i",
+                    final,
+                    "-codec:a",
+                    "libmp3lame",
+                    "-b:a",
+                    f"{quality_kbps}k",
+                    mp3_path,
+                ],
+                check=True,
+                capture_output=True,
+            )
+            os.remove(final)
+            final = mp3_path
+
         os.remove(native)
-        return mp3_path
+        return final
 
     return await asyncio.to_thread(_run)
 
