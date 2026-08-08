@@ -825,11 +825,7 @@ def run_webhook_mode(application: Application | None) -> None:
             pass
         results["cookies_sid"] = str(cookie_ok)
         clients = {
-            "mweb_nocookies": (["mweb"], False),
-            "mweb": (["mweb"], True),
-            "web_safari": (["web_safari"], True),
             "tv": (["tv"], True),
-            "tv_nocookies": (["tv"], False),
         }
         for label, url in [
             ("normal_video", "https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
