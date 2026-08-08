@@ -43,6 +43,7 @@ BOT_API_URL = os.getenv("BOT_API_URL", "https://api.telegram.org/bot")
 BOT_API_FILE_URL = os.getenv("BOT_API_FILE_URL", "https://api.telegram.org/file/bot")
 
 COOKIES_FILE = ""
+COOKIES_BYTES = 0
 _cookies_b64 = os.getenv("COOKIES_TXT_B64", "")
 if _cookies_b64:
     _cookies_path = os.path.join(TEMP_DIR, "cookies.txt")
@@ -50,6 +51,7 @@ if _cookies_b64:
         with open(_cookies_path, "wb") as _f:
             _f.write(base64.b64decode(_cookies_b64))
         COOKIES_FILE = _cookies_path
+        COOKIES_BYTES = os.path.getsize(_cookies_path)
     except Exception:
         COOKIES_FILE = ""
 elif os.getenv("COOKIES_TXT"):
@@ -58,6 +60,7 @@ elif os.getenv("COOKIES_TXT"):
         with open(_cookies_path, "w", encoding="utf-8") as _f:
             _f.write(os.getenv("COOKIES_TXT"))
         COOKIES_FILE = _cookies_path
+        COOKIES_BYTES = os.path.getsize(_cookies_path)
     except OSError:
         COOKIES_FILE = ""
 
@@ -68,10 +71,10 @@ YOUTUBE_URL_RE = re.compile(
     r"([A-Za-z0-9_-]{11})"
 )
 
-YOUTUBE_EXTRACTOR_ARGS = {
-    "youtube": {"player_client": ["android_vr", "tv", "web_safari", "web_embedded"]}
-}
-YOUTUBE_REMOTE_COMPONENTS = {"ejs:github"}
+# android_vr يعمل بدون كوكيز على الفيديوهات العادية حتى من خوادم مركز البيانات.
+# العملاء الأخرى تحتاج كوكيز صالحة؛ نمررها فقط عند الحاجة.
+PLAYER_CLIENTS_NO_COOKIES = ["android_vr", "ios"]
+PLAYER_CLIENTS_WITH_COOKIES = ["tv", "web_safari", "web_embedded"]
 
 TIME_RE = re.compile(r"^(?:(\d+):)?([0-5]?\d):([0-5]\d)$")
 
@@ -80,6 +83,12 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+if COOKIES_FILE:
+    logger.info(
+        "تم تحميل ملف الكوكيز: %s (الحجم: %d بايت)", COOKIES_FILE, COOKIES_BYTES
+    )
+else:
+    logger.info("لم يتم تحميل ملف الكوكيز — سيُستخدم عميل android_vr بدون كوكيز.")
 
 
 def parse_time(value: str) -> int | None:
@@ -129,21 +138,11 @@ def arabic_error(exc: Exception) -> str:
     if (
         "timeout" in message
         or "timed out" in message
+        or "unable to download" in message
         or "connection" in message
-        or "network" in message
-        or "temporary failure" in message
-        or "name or service not known" in message
     ):
-        return "حدثت مشكلة في الشبكة أو الإنترنت بطيء حالياً. حاول مرة أخرى بعد قليل."
-    if "ffmpeg" in message or "ffprobe" in message:
-        return "حدث خطأ في معالجة الصوت (FFmpeg). تأكد من تثبيته على الخادم."
-    if "exited with code" in message:
-        return "توقّف التنزيل أثناء معالجة الصوت (تمت مقاطعته). حاول مرة أخرى."
-    if "unsupported url" in message:
-        return "الرابط غير مدعوم أو غير صالح."
-    if not message or message in ("none", "None"):
-        return "حدث خطأ غير متوقع. حاول مرة أخرى."
-    return f"حدث خطأ غير متوقع: {message[:500]}"
+        return "فشل الاتصال بالخادم. حاول مرة أخرى بعد قليل."
+    return "حدث خطأ غير متوقع. حاول مرة أخرى بعد قليل."
 
 
 async def safe_edit(message, text: str) -> None:
@@ -154,19 +153,32 @@ async def safe_edit(message, text: str) -> None:
 
 
 async def get_video_info(url: str) -> dict:
-    def _fetch():
-        options = {
-            "quiet": True,
-            "noplaylist": True,
-            "skip_download": True,
-            "js_runtimes": {"node": {}, "deno": {}},
-            "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-            "remote_components": YOUTUBE_REMOTE_COMPONENTS,
-        }
-        if COOKIES_FILE:
-            options["cookiefile"] = COOKIES_FILE
-        with yt_dlp.YoutubeDL(options) as ydl:
-            return ydl.extract_info(url, download=False)
+    def _fetch() -> dict:
+        last_error: Exception | None = None
+        strategies = [
+            (PLAYER_CLIENTS_NO_COOKIES, False),
+            (PLAYER_CLIENTS_WITH_COOKIES, True),
+        ]
+        for clients, use_cookies in strategies:
+            options = {
+                "quiet": True,
+                "noplaylist": True,
+                "skip_download": True,
+                "js_runtimes": {"node": {}},
+                "extractor_args": {"youtube": {"player_client": clients}},
+            }
+            if use_cookies and COOKIES_FILE:
+                options["cookiefile"] = COOKIES_FILE
+            try:
+                with yt_dlp.YoutubeDL(options) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception as exc:
+                last_error = exc
+                logger.warning(
+                    "فشل جلب معلومات الفيديو بالعملاء %s (كوكيز=%s): %s",
+                    clients, use_cookies, underlying_error(exc),
+                )
+        raise last_error or RuntimeError("فشل جلب معلومات الفيديو بكل المحاولات")
 
     return await asyncio.to_thread(_fetch)
 
@@ -215,21 +227,20 @@ async def download_audio(
     def _run() -> str | None:
         is_full = start is None and end is None
         options = {
-                "format": "bestaudio[ext=m4a]/bestaudio/best",
-                "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "retries": 5,
-                "fragment_retries": 5,
-                "socket_timeout": 60,
-                "concurrent_fragment_downloads": 10,
-                "js_runtimes": {"node": {}, "deno": {}},
-                "extractor_args": YOUTUBE_EXTRACTOR_ARGS,
-                "remote_components": YOUTUBE_REMOTE_COMPONENTS,
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": os.path.join(TEMP_DIR, f"{uid}.%(ext)s"),
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "retries": 5,
+            "fragment_retries": 5,
+            "socket_timeout": 60,
+            "concurrent_fragment_downloads": 10,
+            "js_runtimes": {"node": {}},
+            "extractor_args": {
+                "youtube": {"player_client": PLAYER_CLIENTS_NO_COOKIES}
+            },
         }
-        if COOKIES_FILE:
-            options["cookiefile"] = COOKIES_FILE
         if FFMPEG_LOCATION:
             options["ffmpeg_location"] = FFMPEG_LOCATION
         if progress_hook:
@@ -397,6 +408,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         info = await get_video_info(context.user_data["url"])
     except Exception as exc:
+        logger.exception("فشل جلب معلومات الفيديو")
         await safe_edit(status, arabic_error(exc))
         return WAITING_FOR_URL
 
@@ -721,7 +733,6 @@ def run_webhook_mode(application: Application | None) -> None:
 
 
 def run_polling_with_health(application: Application | None) -> None:
-    import asyncio
     import uvicorn
     from fastapi import FastAPI
     from fastapi.responses import JSONResponse
